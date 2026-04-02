@@ -82,15 +82,15 @@ export class ChatRoom extends DurableObject<Env> {
       }
 
       if (url.pathname === "/hide-for-user" && request.method === "POST") {
-        return this.handleHideForUser(request);
+        return await this.handleHideForUser(request);
       }
 
       if (url.pathname === "/mute" && request.method === "POST") {
-        return this.handleMute(request, true);
+        return await this.handleMute(request, true);
       }
 
       if (url.pathname === "/unmute" && request.method === "POST") {
-        return this.handleMute(request, false);
+        return await this.handleMute(request, false);
       }
 
       // Notify endpoint for push — called by worker to send push to all members
