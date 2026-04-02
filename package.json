@@ -1,0 +1,27 @@
+{
+  "name": "cloudflare-chat-server",
+  "version": "1.0.0",
+  "description": "Cloudflare Workers + Durable Objects chat backend - Twilio replacement",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev --ip 0.0.0.0",
+    "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "durable-objects",
+    "chat",
+    "websocket"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241022.0",
+    "typescript": "^5.3.0",
+    "wrangler": "^3.91.0"
+  }
+}

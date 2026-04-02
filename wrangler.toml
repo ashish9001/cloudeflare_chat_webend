@@ -1,0 +1,33 @@
+name = "cloudflare-chat"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Durable Object bindings - all phases
+[durable_objects]
+bindings = [
+  { name = "CHAT_ROOM", class_name = "ChatRoom" },
+  { name = "USER_SESSION", class_name = "UserSession" },
+  { name = "NOTIFICATION_ROUTER", class_name = "NotificationRouter" },
+  { name = "CALL_SIGNALING", class_name = "CallSignaling" }
+]
+
+# Migrations for Durable Objects (SQLite-backed)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatRoom", "UserSession", "NotificationRouter", "CallSignaling"]
+
+# Environment variables (set via wrangler secret)
+# wrangler secret put AUTH_SECRET
+
+# FCM HTTP v1 API (service account from Firebase Console > Project Settings > Service accounts)
+# wrangler secret put FCM_PROJECT_ID
+# wrangler secret put FCM_CLIENT_EMAIL
+# wrangler secret put FCM_PRIVATE_KEY
+
+# Cloudinary config for media uploads (signed upload)
+# wrangler secret put CLOUDINARY_CLOUD_NAME
+# wrangler secret put CLOUDINARY_API_KEY
+# wrangler secret put CLOUDINARY_API_SECRET
+
+[env.staging]
+name = "cloudflare-chat-staging"
