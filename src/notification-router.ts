@@ -106,6 +106,8 @@ export class NotificationRouter extends DurableObject<Env> {
 
     await this.ctx.storage.put("devices", trimmed);
 
+    console.log(`[DEVICES] handleRegister: platform=${body.platform} tokenSuffix=...${body.token.slice(-8)} appId=${body.appId || 'none'} totalDevices=${trimmed.length} existing=${existing >= 0 ? 'updated' : 'new'}`);
+
     return new Response(
       JSON.stringify({ ok: true, deviceCount: trimmed.length }),
       { headers: { "Content-Type": "application/json" } }
@@ -199,7 +201,7 @@ export class NotificationRouter extends DurableObject<Env> {
           results.push({ platform: "android", success: result.success });
           if (result.invalidToken) invalidTokens.push(device.token);
         } else if (device.platform === "ios") {
-          const result = await this.sendAPNs(device.token, payload);
+          const result = await this.sendAPNs(device.token, payload, device.appId);
           results.push({ platform: "ios", success: result.success });
           if (result.invalidToken) invalidTokens.push(device.token);
         }
@@ -398,15 +400,32 @@ export class NotificationRouter extends DurableObject<Env> {
    */
   private async sendAPNs(
     deviceToken: string,
-    payload: PushNotificationPayload
+    payload: PushNotificationPayload,
+    deviceAppId?: string
   ): Promise<{ success: boolean; invalidToken?: boolean }> {
-    if (!this.env.APNS_KEY_ID || !this.env.APNS_TEAM_ID || !this.env.APNS_BUNDLE_ID || !this.env.APNS_PRIVATE_KEY) {
+    if (!this.env.APNS_KEY_ID || !this.env.APNS_TEAM_ID || !this.env.APNS_PRIVATE_KEY) {
       console.warn("APNs credentials not set, skipping iOS push");
       return { success: false };
     }
 
+    // Use per-device appId (from registration) as apns-topic if available,
+    // otherwise fall back to APNS_BUNDLE_ID env var.
+    // This supports debug (com.pushtest.temp) and release (com.appypiellc.appypiellc) builds.
+    const apnsTopic = deviceAppId || this.env.APNS_BUNDLE_ID;
+    if (!apnsTopic) {
+      console.warn("APNs: no apns-topic (device appId or APNS_BUNDLE_ID), skipping");
+      return { success: false };
+    }
+
     const apnsJwt = await this.generateAPNsJWT();
-    const apnsUrl = `https://api.push.apple.com/3/device/${deviceToken}`;
+
+    // Use sandbox APNs for debug/test builds, production for release builds.
+    // Sandbox tokens only work with sandbox endpoint and vice versa.
+    const isDebugBuild = deviceAppId === "com.pushtest.temp";
+    const apnsHost = isDebugBuild
+      ? "api.sandbox.push.apple.com"
+      : "api.push.apple.com";
+    const apnsUrl = `https://${apnsHost}/3/device/${deviceToken}`;
 
     const apnsPayload = {
       aps: {
@@ -421,12 +440,14 @@ export class NotificationRouter extends DurableObject<Env> {
       ...(payload.data || {}),
     };
 
+    console.log(`[PUSH] sendAPNs: host=${apnsHost} topic=${apnsTopic} token=...${deviceToken.slice(-8)}`);
+
     const response = await fetch(apnsUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `bearer ${apnsJwt}`,
-        "apns-topic": this.env.APNS_BUNDLE_ID,
+        "apns-topic": apnsTopic,
         "apns-push-type": "alert",
         "apns-priority": "10",
         "apns-expiration": "0",

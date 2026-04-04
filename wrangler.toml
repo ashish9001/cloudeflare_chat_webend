@@ -24,6 +24,12 @@ new_sqlite_classes = ["ChatRoom", "UserSession", "NotificationRouter", "CallSign
 # wrangler secret put FCM_CLIENT_EMAIL
 # wrangler secret put FCM_PRIVATE_KEY
 
+# APNs (iOS push notifications — from Apple Developer > Keys)
+# wrangler secret put APNS_KEY_ID
+# wrangler secret put APNS_TEAM_ID
+# wrangler secret put APNS_BUNDLE_ID
+# wrangler secret put APNS_PRIVATE_KEY
+
 # Cloudinary config for media uploads (signed upload)
 # wrangler secret put CLOUDINARY_CLOUD_NAME
 # wrangler secret put CLOUDINARY_API_KEY

@@ -457,16 +457,9 @@ export class ChatRoom extends DurableObject<Env> {
     // Per-user soft delete: only count messages after user's deleted_at cutoff
     const memberDeletedAt = this.getMemberDeletedAt(userId);
 
-    let countQuery = "SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL";
-    const countParams: (string | number)[] = [];
-    if (memberDeletedAt !== null) {
-      countQuery += " AND created_at > ?";
-      countParams.push(memberDeletedAt);
-    }
-    const countCursor = this.sql.exec(countQuery, ...countParams);
-    const messageCount = (countCursor.one() as { cnt: number })?.cnt ?? 0;
-
-    let lastReadIndex = -1;
+    // lastReadIndex is a Unix ms timestamp (from mark_read), NOT a positional index.
+    // Count unread messages = messages created AFTER the user's last-read timestamp.
+    let lastReadIndex = 0;
     try {
       const lrRow = this.sql
         .exec(
@@ -474,17 +467,35 @@ export class ChatRoom extends DurableObject<Env> {
           userId
         )
         .one() as { last_read_index: number };
-      lastReadIndex = lrRow?.last_read_index ?? -1;
+      lastReadIndex = lrRow?.last_read_index ?? 0;
     } catch {
       /* user may not be in members yet */
     }
 
-    const unreadCount = Math.max(0, messageCount - lastReadIndex - 1);
+    // Total message count (for messageCount field in response)
+    let totalCountQuery = "SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL";
+    const totalCountParams: (string | number)[] = [];
+    if (memberDeletedAt !== null) {
+      totalCountQuery += " AND created_at > ?";
+      totalCountParams.push(memberDeletedAt);
+    }
+    const totalCountCursor = this.sql.exec(totalCountQuery, ...totalCountParams);
+    const messageCount = (totalCountCursor.one() as { cnt: number })?.cnt ?? 0;
+
+    // Unread count: messages created after the user's last-read timestamp
+    let unreadQuery = "SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL AND created_at > ?";
+    const unreadParams: (string | number)[] = [lastReadIndex];
+    if (memberDeletedAt !== null) {
+      unreadQuery += " AND created_at > ?";
+      unreadParams.push(memberDeletedAt);
+    }
+    const unreadCursor = this.sql.exec(unreadQuery, ...unreadParams);
+    const unreadCount = (unreadCursor.one() as { cnt: number })?.cnt ?? 0;
 
     let lastUnreadMessage: MessagePayload | null = null;
     if (unreadCount > 0) {
-      let lastMsgQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL";
-      const lastMsgParams: (string | number)[] = [];
+      let lastMsgQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL AND created_at > ?";
+      const lastMsgParams: (string | number)[] = [lastReadIndex];
       if (memberDeletedAt !== null) {
         lastMsgQuery += " AND created_at > ?";
         lastMsgParams.push(memberDeletedAt);
@@ -516,6 +527,42 @@ export class ChatRoom extends DurableObject<Env> {
       }
     }
 
+    // Always return the most recent message for preview (regardless of read status)
+    let lastMessage: MessagePayload | null = null;
+    {
+      let lmQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL";
+      const lmParams: (string | number)[] = [];
+      if (memberDeletedAt !== null) {
+        lmQuery += " AND created_at > ?";
+        lmParams.push(memberDeletedAt);
+      }
+      lmQuery += " ORDER BY created_at DESC LIMIT 1";
+      const lmCursor = this.sql.exec(lmQuery, ...lmParams);
+      const lmRow = lmCursor.one() as {
+        id: string;
+        sender_id: string;
+        content: string;
+        message_type: string;
+        created_at: number;
+        edited_at: number | null;
+        metadata: string | null;
+        reply_to_id: string | null;
+      } | null;
+      if (lmRow) {
+        lastMessage = {
+          type: "message",
+          id: lmRow.id,
+          senderId: lmRow.sender_id,
+          content: lmRow.content,
+          messageType: lmRow.message_type,
+          createdAt: lmRow.created_at,
+          editedAt: lmRow.edited_at ?? undefined,
+          metadata: lmRow.metadata ? JSON.parse(lmRow.metadata) : undefined,
+          replyToId: lmRow.reply_to_id ?? undefined,
+        };
+      }
+    }
+
     // If user has hidden this conversation and there are no visible messages, flag as hidden
     const hidden = memberDeletedAt !== null && messageCount === 0;
 
@@ -525,6 +572,7 @@ export class ChatRoom extends DurableObject<Env> {
         lastReadIndex,
         unreadCount,
         lastUnreadMessage,
+        lastMessage,
         hidden,
       }),
       { headers: { "Content-Type": "application/json" } }
@@ -1115,7 +1163,7 @@ export class ChatRoom extends DurableObject<Env> {
     );
   }
 
-  // ============ Push notifications for offline users ============
+  // ============ Push notifications for all members ============
 
   private async handleNotifyAll(request: Request): Promise<Response> {
     let body: { senderId: string; content: string; conversationId: string };
@@ -1140,21 +1188,12 @@ export class ChatRoom extends DurableObject<Env> {
       allMembers.filter((m) => m.muted === 1).map((m) => m.user_id)
     );
 
-    // Only push to members who do NOT have an active WebSocket connection and are NOT muted
-    const connectedUserIds = new Set<string>();
-    for (const ws of this.ctx.getWebSockets()) {
-      const tags = this.ctx.getTags(ws);
-      const userTag = tags.find((t) => t.startsWith(USER_TAG_PREFIX));
-      if (userTag) {
-        connectedUserIds.add(userTag.slice(USER_TAG_PREFIX.length));
-      }
-    }
-
+    // Push to ALL members except sender and muted users (regardless of WebSocket connection status)
     const targetMembers = allMembers
       .map((m) => m.user_id)
-      .filter((id) => id !== body.senderId && !connectedUserIds.has(id) && !mutedUserIds.has(id));
+      .filter((id) => id !== body.senderId && !mutedUserIds.has(id));
 
-    // Send push to offline, non-muted members only
+    console.log(`[PUSH] sendPushNotifications: sender=${body.senderId} targetMembers=[${targetMembers.join(',')}] allMembers=[${allMembers.map(m => m.user_id).join(',')}]`);
     for (const userId of targetMembers) {
       try {
         const stub = this.env.NOTIFICATION_ROUTER.get(
@@ -1536,21 +1575,12 @@ export class ChatRoom extends DurableObject<Env> {
 
     const allMemberIds = allMembers.map((m) => m.user_id);
 
-    // Only push to members who do NOT have an active WebSocket connection and are NOT muted
-    const connectedUserIds = new Set<string>();
-    for (const ws of this.ctx.getWebSockets()) {
-      const tags = this.ctx.getTags(ws);
-      const userTag = tags.find((t) => t.startsWith(USER_TAG_PREFIX));
-      if (userTag) {
-        connectedUserIds.add(userTag.slice(USER_TAG_PREFIX.length));
-      }
-    }
-
+    // Push to ALL members except sender and muted users (regardless of WebSocket connection status)
     const targetMembers = allMemberIds.filter(
-      (id) => id !== senderId && !connectedUserIds.has(id) && !mutedUserIds.has(id)
+      (id) => id !== senderId && !mutedUserIds.has(id)
     );
 
-    console.log(`[PUSH] notifyAllMembers: convId=${conversationId} sender=${senderId} allMembers=[${allMemberIds.join(",")}] connected=[${[...connectedUserIds].join(",")}] targets=[${targetMembers.join(",")}]`);
+    console.log(`[PUSH] notifyAllMembers: convId=${conversationId} sender=${senderId} allMembers=[${allMemberIds.join(",")}] targets=[${targetMembers.join(",")}]`);
 
     if (targetMembers.length === 0) {
       console.log(`[PUSH] No members to notify`);

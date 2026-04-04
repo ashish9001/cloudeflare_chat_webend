@@ -238,6 +238,15 @@ export class UserSession extends DurableObject<Env> {
           editedAt?: number;
           metadata?: Record<string, unknown>;
         } | null = null;
+        let lastMessage: {
+          id: string;
+          senderId: string;
+          content: string;
+          messageType: string;
+          createdAt: number;
+          editedAt?: number;
+          metadata?: Record<string, unknown>;
+        } | null = null;
         try {
           const chatRoomId = this.env.CHAT_ROOM.idFromName(conv.conversation_id);
           const stub = this.env.CHAT_ROOM.get(chatRoomId);
@@ -255,9 +264,19 @@ export class UserSession extends DurableObject<Env> {
                 editedAt?: number;
                 metadata?: Record<string, unknown>;
               } | null;
+              lastMessage?: {
+                id: string;
+                senderId: string;
+                content: string;
+                messageType: string;
+                createdAt: number;
+                editedAt?: number;
+                metadata?: Record<string, unknown>;
+              } | null;
             };
             unreadCount = data.unreadCount ?? 0;
             lastUnreadMessage = data.lastUnreadMessage ?? null;
+            lastMessage = data.lastMessage ?? null;
           }
         } catch {
           /* ChatRoom may not be initialized; keep defaults */
@@ -273,6 +292,7 @@ export class UserSession extends DurableObject<Env> {
           createdAt: conv.created_at,
           unreadCount,
           lastUnreadMessage,
+          lastMessage,
           deletedAt: conv.deleted_at ?? undefined,
         };
       })

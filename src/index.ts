@@ -815,6 +815,7 @@ export default {
         return jsonResponse({ error: "Unauthorized" }, 401, corsHeaders);
       }
 
+      console.log(`[DEVICES] POST /devices — registering device for userId=${auth.userId}`);
       const id = env.NOTIFICATION_ROUTER.idFromName(`user_${auth.userId}`);
       const stub = env.NOTIFICATION_ROUTER.get(id);
       const doUrl = new URL(request.url);
