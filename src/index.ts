@@ -815,6 +815,22 @@ export default {
         return jsonResponse({ error: "Unauthorized" }, 401, corsHeaders);
       }
 
+      const rawBody = await request.text();
+      try {
+        const parsed = JSON.parse(rawBody) as { userId?: string };
+        const bodyUserId =
+          parsed.userId != null ? String(parsed.userId).trim() : "";
+        if (bodyUserId.length > 0 && bodyUserId !== String(auth.userId)) {
+          return jsonResponse(
+            { error: "Forbidden: userId must match authenticated user" },
+            403,
+            corsHeaders
+          );
+        }
+      } catch {
+        return jsonResponse({ error: "Invalid JSON body" }, 400, corsHeaders);
+      }
+
       console.log(`[DEVICES] POST /devices — registering device for userId=${auth.userId}`);
       const id = env.NOTIFICATION_ROUTER.idFromName(`user_${auth.userId}`);
       const stub = env.NOTIFICATION_ROUTER.get(id);
@@ -823,7 +839,11 @@ export default {
       return forwardToDO(
         stub,
         doUrl.toString(),
-        { method: "POST", headers: request.headers, body: request.body },
+        {
+          method: "POST",
+          headers: request.headers,
+          body: rawBody,
+        },
         corsHeaders
       );
     }

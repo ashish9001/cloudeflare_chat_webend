@@ -12,7 +12,12 @@ import type { Env, PushNotificationPayload } from "./types";
 interface DeviceRegistration {
   platform: "android" | "ios";
   token: string;
+  /** App build / tenant id (e.g. hex from CMS). */
   appId?: string;
+  /** Must match JWT user when sent; stored for debugging / list devices. */
+  userId?: string;
+  /** APNs bundle id (topic) for iOS, e.g. com.push.temp — used as apns-topic when sending. */
+  signature?: string;
   registeredAt: number;
 }
 
@@ -53,6 +58,8 @@ export class NotificationRouter extends DurableObject<Env> {
       platform: "android" | "ios";
       token: string;
       appId?: string;
+      userId?: string;
+      signature?: string;
     };
     try {
       body = (await request.json()) as typeof body;
@@ -90,6 +97,8 @@ export class NotificationRouter extends DurableObject<Env> {
       platform: body.platform,
       token: body.token,
       appId: body.appId,
+      userId: body.userId,
+      signature: body.signature,
       registeredAt: Date.now(),
     };
 
@@ -106,7 +115,7 @@ export class NotificationRouter extends DurableObject<Env> {
 
     await this.ctx.storage.put("devices", trimmed);
 
-    console.log(`[DEVICES] handleRegister: platform=${body.platform} tokenSuffix=...${body.token.slice(-8)} appId=${body.appId || 'none'} totalDevices=${trimmed.length} existing=${existing >= 0 ? 'updated' : 'new'}`);
+    console.log(`[DEVICES] handleRegister: platform=${body.platform} tokenSuffix=...${body.token.slice(-8)} appId=${body.appId || 'none'} userId=${body.userId || 'none'} signature=${body.signature || 'none'} totalDevices=${trimmed.length} existing=${existing >= 0 ? 'updated' : 'new'}`);
 
     return new Response(
       JSON.stringify({ ok: true, deviceCount: trimmed.length }),
@@ -150,6 +159,8 @@ export class NotificationRouter extends DurableObject<Env> {
           platform: d.platform,
           registeredAt: d.registeredAt,
           appId: d.appId,
+          userId: d.userId,
+          signature: d.signature,
           // Don't expose full token — show last 6 chars only
           tokenSuffix: d.token.slice(-6),
         })),
@@ -201,7 +212,7 @@ export class NotificationRouter extends DurableObject<Env> {
           results.push({ platform: "android", success: result.success });
           if (result.invalidToken) invalidTokens.push(device.token);
         } else if (device.platform === "ios") {
-          const result = await this.sendAPNs(device.token, payload, device.appId);
+          const result = await this.sendAPNs(device.token, payload, device.signature, device.appId);
           results.push({ platform: "ios", success: result.success });
           if (result.invalidToken) invalidTokens.push(device.token);
         }
@@ -423,6 +434,9 @@ export class NotificationRouter extends DurableObject<Env> {
   private async sendAPNs(
     deviceToken: string,
     payload: PushNotificationPayload,
+    /** Bundle id / apns-topic — from registration field `signature` (preferred for iOS). */
+    signature?: string,
+    /** Optional app id from registration (hex or legacy); not used as topic unless it looks like a bundle id. */
     deviceAppId?: string
   ): Promise<{ success: boolean; invalidToken?: boolean }> {
     if (!this.env.APNS_KEY_ID || !this.env.APNS_TEAM_ID || !this.env.APNS_PRIVATE_KEY) {
@@ -430,20 +444,22 @@ export class NotificationRouter extends DurableObject<Env> {
       return { success: false };
     }
 
-    // Use per-device appId (from registration) as apns-topic if available,
-    // otherwise fall back to APNS_BUNDLE_ID env var.
-    // This supports debug (com.pushtest.temp) and release (com.appypiellc.appypiellc) builds.
-    const apnsTopic = deviceAppId || this.env.APNS_BUNDLE_ID;
+    // APNs topic: prefer `signature` (bundle id, e.g. com.push.temp), then bundle-like appId, then env.
+    // Do not use hex app ids (no ".") as topic.
+    let apnsTopic: string | undefined;
+    if (signature?.includes(".")) apnsTopic = signature.trim();
+    else if (deviceAppId?.includes(".")) apnsTopic = deviceAppId.trim();
+    else if (signature?.trim()) apnsTopic = signature.trim();
+    else apnsTopic = this.env.APNS_BUNDLE_ID;
     if (!apnsTopic) {
-      console.warn("APNs: no apns-topic (device appId or APNS_BUNDLE_ID), skipping");
+      console.warn("APNs: no apns-topic (signature, bundle-like appId, or APNS_BUNDLE_ID), skipping");
       return { success: false };
     }
 
     const apnsJwt = await this.generateAPNsJWT();
 
-    // Use sandbox APNs for debug/test builds, production for release builds.
-    // Sandbox tokens only work with sandbox endpoint and vice versa.
-    const isDebugBuild = deviceAppId === "com.pushtest.temp";
+    // Sandbox only for known debug bundle (tokens must match endpoint).
+    const isDebugBuild = apnsTopic === "com.pushtest.temp";
     const apnsHost = isDebugBuild
       ? "api.sandbox.push.apple.com"
       : "api.push.apple.com";
