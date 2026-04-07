@@ -84,6 +84,14 @@ export class UserSession extends DurableObject<Env> {
       return this.handleRemoveConversation(request);
     }
 
+    if (url.pathname === "/conversations/update-name" && request.method === "POST") {
+      return this.handleUpdateConversationName(request);
+    }
+
+    if (url.pathname === "/conversations/add-participants" && request.method === "POST") {
+      return this.handleAddParticipants(request);
+    }
+
     return new Response("Not found", { status: 404 });
   }
 
@@ -211,7 +219,7 @@ export class UserSession extends DurableObject<Env> {
     const conversationResults = await Promise.all(
       convRows.map(async (conv) => {
         const partCursor = this.sql.exec(
-          "SELECT user_id, name, email, image FROM conversation_participants WHERE conversation_id = ?",
+          "SELECT user_id, name, email, image FROM conversation_participants WHERE conversation_id = ? ORDER BY user_id ASC",
           conv.conversation_id
         );
         const partRows = partCursor.toArray() as Array<{
@@ -427,6 +435,76 @@ export class UserSession extends DurableObject<Env> {
     const state = await this.getPresenceState();
     state.activeConnections.delete(body.conversationId);
     await this.savePresenceState(state);
+
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  private async handleUpdateConversationName(request: Request): Promise<Response> {
+    let body: { conversationId: string; name: string };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON body" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!body.conversationId || body.name === undefined) {
+      return new Response(
+        JSON.stringify({ error: "conversationId and name required" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    this.ensureConversationSchema();
+
+    this.sql.exec(
+      "UPDATE conversations SET name = ? WHERE conversation_id = ?",
+      body.name,
+      body.conversationId
+    );
+
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  private async handleAddParticipants(request: Request): Promise<Response> {
+    let body: {
+      conversationId: string;
+      participants: Array<{ userId: string; name?: string; email?: string; image?: string }>;
+    };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON body" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!body.conversationId || !body.participants?.length) {
+      return new Response(
+        JSON.stringify({ error: "conversationId and participants required" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    this.ensureConversationSchema();
+
+    for (const p of body.participants) {
+      this.sql.exec(
+        "INSERT OR REPLACE INTO conversation_participants (conversation_id, user_id, name, email, image) VALUES (?, ?, ?, ?, ?)",
+        body.conversationId,
+        p.userId,
+        p.name || null,
+        p.email || null,
+        p.image || null
+      );
+    }
 
     return new Response(JSON.stringify({ ok: true }), {
       headers: { "Content-Type": "application/json" },

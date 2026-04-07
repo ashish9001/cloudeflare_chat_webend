@@ -240,7 +240,11 @@ export class NotificationRouter extends DurableObject<Env> {
     payload: PushNotificationPayload
   ): Promise<{ success: boolean; invalidToken?: boolean }> {
     if (!this.env.FCM_PROJECT_ID || !this.env.FCM_CLIENT_EMAIL || !this.env.FCM_PRIVATE_KEY) {
-      console.warn("[PUSH] FCM v1 credentials not set (FCM_PROJECT_ID, FCM_CLIENT_EMAIL, FCM_PRIVATE_KEY), skipping Android push");
+      console.error("[PUSH] FCM v1 credentials MISSING — check wrangler secrets:", {
+        hasProjectId: !!this.env.FCM_PROJECT_ID,
+        hasClientEmail: !!this.env.FCM_CLIENT_EMAIL,
+        hasPrivateKey: !!this.env.FCM_PRIVATE_KEY,
+      });
       return { success: false };
     }
 
@@ -249,7 +253,7 @@ export class NotificationRouter extends DurableObject<Env> {
     // Get or refresh OAuth2 access token
     const accessToken = await this.getFCMAccessToken();
     if (!accessToken) {
-      console.error("[PUSH] Failed to obtain FCM OAuth2 access token");
+      console.error("[PUSH] Failed to obtain FCM OAuth2 access token — check FCM_PRIVATE_KEY format (must be valid PEM)");
       return { success: false };
     }
 
@@ -266,22 +270,41 @@ export class NotificationRouter extends DurableObject<Env> {
       body: payload.body || "",
     };
 
-    const response = await fetch(fcmUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify({
-        message: {
-          token: token,
-          data: dataPayload,
-          android: {
-            priority: "HIGH",
-          },
+    const fcmBody = JSON.stringify({
+      message: {
+        token: token,
+        data: dataPayload,
+        android: {
+          priority: "HIGH",
         },
-      }),
+      },
     });
+
+    const doFcmRequest = async (authToken: string): Promise<globalThis.Response> => {
+      return fetch(fcmUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: fcmBody,
+      });
+    };
+
+    let response = await doFcmRequest(accessToken);
+
+    // Retry once on 401 (expired token) with a fresh OAuth2 token
+    if (response.status === 401) {
+      console.warn("[PUSH] FCM 401 — access token expired, refreshing and retrying...");
+      cachedAccessToken = null;
+      const freshToken = await this.getFCMAccessToken();
+      if (freshToken) {
+        response = await doFcmRequest(freshToken);
+      } else {
+        console.error("[PUSH] FCM retry failed — could not obtain fresh access token");
+        return { success: false };
+      }
+    }
 
     if (!response.ok) {
       const text = await response.text();
@@ -291,17 +314,12 @@ export class NotificationRouter extends DurableObject<Env> {
       try {
         const errJson = JSON.parse(text);
         const errCode = errJson?.error?.details?.[0]?.errorCode || errJson?.error?.status;
-        if (errCode === "UNREGISTERED" || errCode === "INVALID_ARGUMENT" || response.status === 404) {
+        if (errCode === "UNREGISTERED" || response.status === 404) {
+          console.warn(`[PUSH] FCM token invalid (${errCode}) — marking for removal`);
           return { success: false, invalidToken: true };
         }
       } catch {
         // Ignore parse errors
-      }
-
-      if (response.status === 401) {
-        // Token expired — clear cache and retry once
-        cachedAccessToken = null;
-        console.warn("FCM access token expired, cleared cache");
       }
 
       return { success: false };
@@ -343,6 +361,10 @@ export class NotificationRouter extends DurableObject<Env> {
 
       // Import RSA private key
       const keyData = this.pemToArrayBuffer(this.env.FCM_PRIVATE_KEY || "");
+      if (keyData.byteLength === 0) {
+        console.error("[PUSH] getFCMAccessToken: RSA private key is empty — check FCM_PRIVATE_KEY secret");
+        return null;
+      }
       const key = await crypto.subtle.importKey(
         "pkcs8",
         keyData,
@@ -490,6 +512,10 @@ export class NotificationRouter extends DurableObject<Env> {
 
     // Import the P-256 private key
     const keyData = this.pemToArrayBuffer(this.env.APNS_PRIVATE_KEY || "");
+    if (keyData.byteLength === 0) {
+      console.error("[PUSH] generateAPNsJWT: EC private key is empty — check APNS_PRIVATE_KEY secret");
+      throw new Error("APNs private key is empty");
+    }
     const key = await crypto.subtle.importKey(
       "pkcs8",
       keyData,
@@ -530,12 +556,18 @@ export class NotificationRouter extends DurableObject<Env> {
   }
 
   private pemToArrayBuffer(pem: string): ArrayBuffer {
+    // Keys pasted from Firebase/Apple JSON files contain literal "\n" (two chars)
+    // instead of real newlines. Convert them before stripping.
     const b64 = pem
-      .replace(/-----BEGIN PRIVATE KEY-----/g, "")
-      .replace(/-----END PRIVATE KEY-----/g, "")
-      .replace(/-----BEGIN RSA PRIVATE KEY-----/g, "")
-      .replace(/-----END RSA PRIVATE KEY-----/g, "")
+      .replace(/\\n/g, "\n")
+      .replace(/-----BEGIN (?:RSA )?PRIVATE KEY-----/g, "")
+      .replace(/-----END (?:RSA )?PRIVATE KEY-----/g, "")
       .replace(/\s/g, "");
+
+    if (b64.length === 0) {
+      console.error("[PUSH] pemToArrayBuffer: PEM key is empty after stripping headers — check secret format");
+    }
+
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {

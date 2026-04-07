@@ -433,8 +433,8 @@ export class ChatRoom extends DurableObject<Env> {
   }
 
   /**
-   * Lightweight summary for unread count: returns messageCount, lastReadIndex, unreadCount, lastUnreadMessage.
-   * Unread = max(0, messageCount - lastReadIndex - 1).
+   * Lightweight summary: returns messageCount, lastReadIndex, unreadCount, lastUnreadMessage, lastMessage.
+   * Unread = count of messages created after max(lastReadIndex, memberDeletedAt) WHERE sender_id != userId.
    */
   private handleGetSummary(url: URL): Response {
     this.ensureSchema();
@@ -482,26 +482,27 @@ export class ChatRoom extends DurableObject<Env> {
     const totalCountCursor = this.sql.exec(totalCountQuery, ...totalCountParams);
     const messageCount = (totalCountCursor.one() as { cnt: number })?.cnt ?? 0;
 
-    // Unread count: messages created after the user's last-read timestamp
-    let unreadQuery = "SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL AND created_at > ?";
-    const unreadParams: (string | number)[] = [lastReadIndex];
-    if (memberDeletedAt !== null) {
-      unreadQuery += " AND created_at > ?";
-      unreadParams.push(memberDeletedAt);
-    }
-    const unreadCursor = this.sql.exec(unreadQuery, ...unreadParams);
+    // Unread count: messages created after the later of lastReadIndex and memberDeletedAt,
+    // excluding the user's own messages (you shouldn't see your own messages as unread).
+    // Use MAX so that if the user hid the conversation (deletedAt > lastReadIndex),
+    // we only count messages after the hide; and vice versa.
+    const unreadThreshold = memberDeletedAt !== null
+      ? Math.max(lastReadIndex, memberDeletedAt)
+      : lastReadIndex;
+    const unreadCursor = this.sql.exec(
+      "SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL AND created_at > ? AND sender_id != ?",
+      unreadThreshold,
+      userId
+    );
     const unreadCount = (unreadCursor.one() as { cnt: number })?.cnt ?? 0;
 
     let lastUnreadMessage: MessagePayload | null = null;
     if (unreadCount > 0) {
-      let lastMsgQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL AND created_at > ?";
-      const lastMsgParams: (string | number)[] = [lastReadIndex];
-      if (memberDeletedAt !== null) {
-        lastMsgQuery += " AND created_at > ?";
-        lastMsgParams.push(memberDeletedAt);
-      }
-      lastMsgQuery += " ORDER BY created_at DESC LIMIT 1";
-      const lastMsgCursor = this.sql.exec(lastMsgQuery, ...lastMsgParams);
+      const lastMsgCursor = this.sql.exec(
+        "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL AND created_at > ? AND sender_id != ? ORDER BY created_at DESC LIMIT 1",
+        unreadThreshold,
+        userId
+      );
       const row = lastMsgCursor.one() as {
         id: string;
         sender_id: string;
@@ -528,16 +529,13 @@ export class ChatRoom extends DurableObject<Env> {
     }
 
     // Always return the most recent message for preview (regardless of read status)
+    // For lastMessage, only filter by memberDeletedAt (not lastReadIndex) since we want
+    // the latest message even if it's already read.
     let lastMessage: MessagePayload | null = null;
     {
-      let lmQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL";
-      const lmParams: (string | number)[] = [];
-      if (memberDeletedAt !== null) {
-        lmQuery += " AND created_at > ?";
-        lmParams.push(memberDeletedAt);
-      }
-      lmQuery += " ORDER BY created_at DESC LIMIT 1";
-      const lmCursor = this.sql.exec(lmQuery, ...lmParams);
+      const lmThreshold = memberDeletedAt ?? 0;
+      const lmQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL AND created_at > ? ORDER BY created_at DESC LIMIT 1";
+      const lmCursor = this.sql.exec(lmQuery, lmThreshold);
       const lmRow = lmCursor.one() as {
         id: string;
         sender_id: string;
@@ -656,6 +654,28 @@ export class ChatRoom extends DurableObject<Env> {
     const now = Date.now();
     const added: string[] = [];
 
+    // Build a participant lookup from the client-provided participants array
+    const participantMap = new Map<string, ConversationParticipant>();
+    if (body.participants) {
+      for (const p of body.participants) {
+        participantMap.set(p.userId, p);
+      }
+    }
+
+    // Get all existing member IDs before adding new ones
+    const existingMemberRows = this.sql
+      .exec("SELECT user_id FROM members")
+      .toArray() as Array<{ user_id: string }>;
+    const existingMemberIds = existingMemberRows.map((r) => r.user_id);
+
+    // Build full participant list (existing members + participants from request)
+    // to send to new members so they see everyone's name/email/image
+    const allParticipants: ConversationParticipant[] = [];
+    for (const memberId of existingMemberIds) {
+      const fromRequest = participantMap.get(memberId);
+      allParticipants.push(fromRequest || { userId: memberId });
+    }
+
     for (const userId of body.userIds) {
       if (!this.isMember(userId)) {
         this.sql.exec(
@@ -667,7 +687,16 @@ export class ChatRoom extends DurableObject<Env> {
         );
         added.push(userId);
 
-        // Register conversation in their UserSession
+        // Build participant info for the new member from request data
+        const newMemberParticipant = participantMap.get(userId) || { userId };
+
+        // Full participant list for the new member: all existing + themselves
+        const fullParticipantsForNewMember = [
+          ...allParticipants,
+          newMemberParticipant,
+        ];
+
+        // Register conversation in new member's UserSession with full participant list
         try {
           const stub = this.env.USER_SESSION.get(
             this.env.USER_SESSION.idFromName(`user_${userId}`)
@@ -681,12 +710,37 @@ export class ChatRoom extends DurableObject<Env> {
               type: "group",
               name: convName,
               createdAt: now,
-              participants: body.participants || [{ userId }],
+              participants: fullParticipantsForNewMember,
             }),
           });
         } catch (e) {
           console.error(`Failed to register conversation for new member ${userId}:`, e);
         }
+
+        // Update all existing members' UserSession with the new member's participant details
+        await Promise.all(
+          existingMemberIds.map(async (existingUserId) => {
+            try {
+              const stub = this.env.USER_SESSION.get(
+                this.env.USER_SESSION.idFromName(`user_${existingUserId}`)
+              );
+              await stub.fetch("https://internal/conversations/add-participants", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  conversationId: body.conversationId,
+                  participants: [newMemberParticipant],
+                }),
+              });
+            } catch (e) {
+              console.error(`Failed to add participant ${userId} to UserSession for ${existingUserId}:`, e);
+            }
+          })
+        );
+
+        // Add the new member to allParticipants so subsequent new members see them too
+        allParticipants.push(newMemberParticipant);
+        existingMemberIds.push(userId);
 
         // Broadcast member added to existing connections
         this.broadcast({
@@ -908,6 +962,33 @@ export class ChatRoom extends DurableObject<Env> {
         );
       }
       await this.ctx.storage.put("conversation_name", trimmedName);
+
+      // Sync name to each member's UserSession conversations table
+      const conversationId = (await this.ctx.storage.get("conversation_id")) as string;
+      const memberRows = this.sql
+        .exec("SELECT user_id FROM members")
+        .toArray() as Array<{ user_id: string }>;
+
+      await Promise.all(
+        memberRows.map(async (row) => {
+          try {
+            const stub = this.env.USER_SESSION.get(
+              this.env.USER_SESSION.idFromName(`user_${row.user_id}`)
+            );
+            await stub.fetch("https://internal/conversations/update-name", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                conversationId,
+                name: trimmedName,
+              }),
+            });
+          } catch (e) {
+            console.error(`Failed to sync conversation name to UserSession for ${row.user_id}:`, e);
+          }
+        })
+      );
+
       // Broadcast name change to all connected members
       this.broadcast({
         type: "conversation_updated",
@@ -1575,12 +1656,21 @@ export class ChatRoom extends DurableObject<Env> {
 
     const allMemberIds = allMembers.map((m) => m.user_id);
 
-    // Push to ALL members except sender and muted users (regardless of WebSocket connection status)
+    // Identify users with active WebSocket connections — they already receive
+    // messages in real-time, so skip push for them.
+    const connectedUserIds = new Set<string>();
+    for (const ws of this.ctx.getWebSockets()) {
+      const tags = this.ctx.getTags(ws);
+      const userTag = tags.find((t) => t.startsWith(USER_TAG_PREFIX));
+      if (userTag) connectedUserIds.add(userTag.slice(USER_TAG_PREFIX.length));
+    }
+
+    // Push only to OFFLINE, non-muted members (excluding sender)
     const targetMembers = allMemberIds.filter(
-      (id) => id !== senderId && !mutedUserIds.has(id)
+      (id) => id !== senderId && !mutedUserIds.has(id) && !connectedUserIds.has(id)
     );
 
-    console.log(`[PUSH] notifyAllMembers: convId=${conversationId} sender=${senderId} allMembers=[${allMemberIds.join(",")}] targets=[${targetMembers.join(",")}]`);
+    console.log(`[PUSH] notifyAllMembers: convId=${conversationId} sender=${senderId} connected=[${[...connectedUserIds].join(",")}] targets=[${targetMembers.join(",")}]`);
 
     if (targetMembers.length === 0) {
       console.log(`[PUSH] No members to notify`);
