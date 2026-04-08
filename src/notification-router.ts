@@ -12,6 +12,8 @@ import type { Env, PushNotificationPayload } from "./types";
 interface DeviceRegistration {
   platform: "android" | "ios";
   token: string;
+  /** VoIP push token for iOS (PushKit) — used for call_incoming pushes */
+  voipToken?: string;
   /** App build / tenant id (e.g. hex from CMS). */
   appId?: string;
   /** Must match JWT user when sent; stored for debugging / list devices. */
@@ -57,6 +59,7 @@ export class NotificationRouter extends DurableObject<Env> {
     let body: {
       platform: "android" | "ios";
       token: string;
+      voipToken?: string;
       appId?: string;
       userId?: string;
       signature?: string;
@@ -96,6 +99,7 @@ export class NotificationRouter extends DurableObject<Env> {
     const reg: DeviceRegistration = {
       platform: body.platform,
       token: body.token,
+      voipToken: body.voipToken,
       appId: body.appId,
       userId: body.userId,
       signature: body.signature,
@@ -212,9 +216,17 @@ export class NotificationRouter extends DurableObject<Env> {
           results.push({ platform: "android", success: result.success });
           if (result.invalidToken) invalidTokens.push(device.token);
         } else if (device.platform === "ios") {
-          const result = await this.sendAPNs(device.token, payload, device.signature, device.appId);
-          results.push({ platform: "ios", success: result.success });
-          if (result.invalidToken) invalidTokens.push(device.token);
+          // For call_incoming, use VoIP push if voipToken is available
+          const isCallPush = payload.data?.type === "call_incoming";
+          if (isCallPush && device.voipToken) {
+            const result = await this.sendAPNs(device.voipToken, payload, device.signature, device.appId, "voip");
+            results.push({ platform: "ios-voip", success: result.success });
+            if (result.invalidToken) invalidTokens.push(device.voipToken);
+          } else {
+            const result = await this.sendAPNs(device.token, payload, device.signature, device.appId);
+            results.push({ platform: "ios", success: result.success });
+            if (result.invalidToken) invalidTokens.push(device.token);
+          }
         }
       } catch (e) {
         console.error(`Push send failed for ${device.platform}:`, e);
@@ -437,7 +449,9 @@ export class NotificationRouter extends DurableObject<Env> {
     /** Bundle id / apns-topic — from registration field `signature` (preferred for iOS). */
     signature?: string,
     /** Optional app id from registration (hex or legacy); not used as topic unless it looks like a bundle id. */
-    deviceAppId?: string
+    deviceAppId?: string,
+    /** Push type: "alert" (default) or "voip" for call notifications */
+    pushType: "alert" | "voip" = "alert"
   ): Promise<{ success: boolean; invalidToken?: boolean }> {
     if (!this.env.APNS_KEY_ID || !this.env.APNS_TEAM_ID || !this.env.APNS_PRIVATE_KEY) {
       console.warn("APNs credentials not set, skipping iOS push");
@@ -456,6 +470,9 @@ export class NotificationRouter extends DurableObject<Env> {
       return { success: false };
     }
 
+    // For VoIP pushes, append .voip to the topic
+    const effectiveTopic = pushType === "voip" ? `${apnsTopic}.voip` : apnsTopic;
+
     const apnsJwt = await this.generateAPNsJWT();
 
     // Sandbox only for known debug bundle (tokens must match endpoint).
@@ -465,28 +482,37 @@ export class NotificationRouter extends DurableObject<Env> {
       : "api.push.apple.com";
     const apnsUrl = `https://${apnsHost}/3/device/${deviceToken}`;
 
-    const apnsPayload = {
-      aps: {
-        alert: {
-          title: payload.title,
-          body: payload.body,
-        },
-        sound: "default",
-        badge: 1,
-        "mutable-content": 1,
-      },
-      ...(payload.data || {}),
-    };
+    // VoIP pushes have a different payload structure — no alert, just data
+    const apnsPayload = pushType === "voip"
+      ? {
+          aps: {},
+          ...(payload.data || {}),
+          // Include title/body as data fields for the app to use
+          pushTitle: payload.title,
+          pushBody: payload.body,
+        }
+      : {
+          aps: {
+            alert: {
+              title: payload.title,
+              body: payload.body,
+            },
+            sound: "default",
+            badge: 1,
+            "mutable-content": 1,
+          },
+          ...(payload.data || {}),
+        };
 
-    console.log(`[PUSH] sendAPNs: host=${apnsHost} topic=${apnsTopic} token=...${deviceToken.slice(-8)}`);
+    console.log(`[PUSH] sendAPNs: host=${apnsHost} topic=${effectiveTopic} pushType=${pushType} token=...${deviceToken.slice(-8)}`);
 
     const response = await fetch(apnsUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `bearer ${apnsJwt}`,
-        "apns-topic": apnsTopic,
-        "apns-push-type": "alert",
+        "apns-topic": effectiveTopic,
+        "apns-push-type": pushType,
         "apns-priority": "10",
         "apns-expiration": "0",
       },

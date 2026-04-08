@@ -356,6 +356,34 @@ export class CallSignaling extends DurableObject<Env> {
       callId: metadata.callId,
       userId,
     });
+
+    // Send push notification to all participants except the accepter
+    // so their devices can dismiss the incoming call notification
+    for (const participantId of metadata.participants) {
+      if (participantId === userId) continue;
+      try {
+        const stub = this.env.NOTIFICATION_ROUTER.get(
+          this.env.NOTIFICATION_ROUTER.idFromName(`user_${participantId}`)
+        );
+        await stub.fetch("https://internal/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Call Accepted",
+            body: "Call was answered",
+            data: {
+              source: "cloudflare-chat",
+              type: "call_accepted",
+              callId: metadata.callId,
+              userId,
+              ...(metadata.feature ? { feature: metadata.feature } : {}),
+            },
+          }),
+        });
+      } catch (e) {
+        console.error(`Failed to send call_accepted push to ${participantId}:`, e);
+      }
+    }
   }
 
   private async handleRejectCall(userId: string, reason?: string): Promise<void> {
@@ -370,6 +398,32 @@ export class CallSignaling extends DurableObject<Env> {
       userId,
       reason: reason || "declined",
     });
+
+    // Send push notification to caller about the rejection
+    // (so their device gets notified even if WS is disconnected)
+    try {
+      const stub = this.env.NOTIFICATION_ROUTER.get(
+        this.env.NOTIFICATION_ROUTER.idFromName(`user_${metadata.callerId}`)
+      );
+      await stub.fetch("https://internal/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Call Declined",
+          body: "Call was declined",
+          data: {
+            source: "cloudflare-chat",
+            type: "call_rejected",
+            callId: metadata.callId,
+            userId,
+            reason: reason || "declined",
+            ...(metadata.feature ? { feature: metadata.feature } : {}),
+          },
+        }),
+      });
+    } catch (e) {
+      console.error(`Failed to send call_rejected push to caller ${metadata.callerId}:`, e);
+    }
 
     // If all non-caller participants rejected, end the call
     const nonCallerParticipants = metadata.participants.filter((p) => p !== metadata.callerId);

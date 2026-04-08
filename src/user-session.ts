@@ -92,6 +92,10 @@ export class UserSession extends DurableObject<Env> {
       return this.handleAddParticipants(request);
     }
 
+    if (url.pathname === "/conversations/remove-participant" && request.method === "POST") {
+      return this.handleRemoveParticipant(request);
+    }
+
     return new Response("Not found", { status: 404 });
   }
 
@@ -505,6 +509,37 @@ export class UserSession extends DurableObject<Env> {
         p.image || null
       );
     }
+
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  private async handleRemoveParticipant(request: Request): Promise<Response> {
+    let body: { conversationId: string; userId: string };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON body" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!body.conversationId || !body.userId) {
+      return new Response(
+        JSON.stringify({ error: "conversationId and userId required" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    this.ensureConversationSchema();
+
+    this.sql.exec(
+      "DELETE FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+      body.conversationId,
+      body.userId
+    );
 
     return new Response(JSON.stringify({ ok: true }), {
       headers: { "Content-Type": "application/json" },

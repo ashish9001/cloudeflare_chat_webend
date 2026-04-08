@@ -822,6 +822,42 @@ export class ChatRoom extends DurableObject<Env> {
           } catch { /* already closed */ }
         }
 
+        // Disconnect removed user's presence for this conversation
+        try {
+          const presenceStub = this.env.USER_SESSION.get(
+            this.env.USER_SESSION.idFromName(`user_${userId}`)
+          );
+          await presenceStub.fetch("https://internal/presence?status=offline&action=disconnect&conversationId=" + encodeURIComponent(body.conversationId), {
+            method: "POST",
+          });
+        } catch (e) {
+          console.error(`Failed to disconnect presence for removed user ${userId}:`, e);
+        }
+
+        // Remove participant from all remaining members' UserSession conversation_participants
+        const remainingMembers = this.sql
+          .exec("SELECT user_id FROM members")
+          .toArray() as Array<{ user_id: string }>;
+        await Promise.all(
+          remainingMembers.map(async (m) => {
+            try {
+              const stub = this.env.USER_SESSION.get(
+                this.env.USER_SESSION.idFromName(`user_${m.user_id}`)
+              );
+              await stub.fetch("https://internal/conversations/remove-participant", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  conversationId: body.conversationId,
+                  userId,
+                }),
+              });
+            } catch (e) {
+              console.error(`Failed to remove participant ${userId} from UserSession for ${m.user_id}:`, e);
+            }
+          })
+        );
+
         this.broadcast({
           type: "member_removed",
           userId,
@@ -919,6 +955,42 @@ export class ChatRoom extends DurableObject<Env> {
         ws.close(4004, "Left conversation");
       } catch { /* already closed */ }
     }
+
+    // Disconnect leaving user's presence for this conversation
+    try {
+      const presenceStub = this.env.USER_SESSION.get(
+        this.env.USER_SESSION.idFromName(`user_${body.userId}`)
+      );
+      await presenceStub.fetch("https://internal/presence?status=offline&action=disconnect&conversationId=" + encodeURIComponent(body.conversationId), {
+        method: "POST",
+      });
+    } catch (e) {
+      console.error(`Failed to disconnect presence for leaving user ${body.userId}:`, e);
+    }
+
+    // Remove participant from all remaining members' UserSession conversation_participants
+    const remainingMembers = this.sql
+      .exec("SELECT user_id FROM members")
+      .toArray() as Array<{ user_id: string }>;
+    await Promise.all(
+      remainingMembers.map(async (m) => {
+        try {
+          const stub = this.env.USER_SESSION.get(
+            this.env.USER_SESSION.idFromName(`user_${m.user_id}`)
+          );
+          await stub.fetch("https://internal/conversations/remove-participant", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              conversationId: body.conversationId,
+              userId: body.userId,
+            }),
+          });
+        } catch (e) {
+          console.error(`Failed to remove participant ${body.userId} from UserSession for ${m.user_id}:`, e);
+        }
+      })
+    );
 
     this.broadcast({
       type: "member_removed",
