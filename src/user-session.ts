@@ -209,7 +209,7 @@ export class UserSession extends DurableObject<Env> {
     }
 
     const convCursor = this.sql.exec(
-      "SELECT conversation_id, type, name, created_at, deleted_at, feature FROM conversations ORDER BY created_at DESC"
+      "SELECT conversation_id, type, name, created_at, deleted_at, feature FROM conversations WHERE deleted_at IS NULL ORDER BY created_at DESC"
     );
     const convRows = convCursor.toArray() as Array<{
       conversation_id: string;
@@ -305,7 +305,6 @@ export class UserSession extends DurableObject<Env> {
           unreadCount,
           lastUnreadMessage,
           lastMessage,
-          deletedAt: conv.deleted_at ?? undefined,
         };
       })
     );
@@ -345,11 +344,10 @@ export class UserSession extends DurableObject<Env> {
     this.ensureConversationSchema();
 
     const now = body.createdAt || Date.now();
-    // INSERT OR IGNORE: if the conversation row already exists, leave it unchanged.
-    // With the unjoin model, unjoining deletes the row entirely (via handleRemoveConversation),
-    // so rejoining (via createConversation → handleInit) will INSERT successfully.
+    // INSERT with ON CONFLICT: if the conversation already exists, clear deleted_at
+    // so hidden conversations reappear when a new message triggers handleAddConversation.
     this.sql.exec(
-      "INSERT OR IGNORE INTO conversations (conversation_id, type, name, created_at, feature) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO conversations (conversation_id, type, name, created_at, feature) VALUES (?, ?, ?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET deleted_at = NULL",
       body.conversationId,
       body.type || "dm",
       body.name || null,

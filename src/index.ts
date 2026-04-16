@@ -723,6 +723,59 @@ export default {
       }
     }
 
+    // ============ REST: Clear Chat (per-user: hides all messages before now) ============
+    const clearChatMatch = url.pathname.match(
+      /^\/conversations\/([^/]+)\/clear$/
+    );
+    if (clearChatMatch && request.method === "POST") {
+      const auth = await getAuth(request, env);
+      if (!auth) {
+        return jsonResponse({ error: "Unauthorized" }, 401, corsHeaders);
+      }
+
+      const conversationId = clearChatMatch[1];
+      const id = env.CHAT_ROOM.idFromName(conversationId);
+      const stub = env.CHAT_ROOM.get(id);
+
+      return forwardToDO(
+        stub,
+        "https://internal/clear-chat",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId: auth.userId }),
+        },
+        corsHeaders
+      );
+    }
+
+    // ============ REST: Hide Message (per-user: hides a single message for requesting user) ============
+    const hideMessageMatch = url.pathname.match(
+      /^\/conversations\/([^/]+)\/messages\/([^/]+)\/hide$/
+    );
+    if (hideMessageMatch && request.method === "POST") {
+      const auth = await getAuth(request, env);
+      if (!auth) {
+        return jsonResponse({ error: "Unauthorized" }, 401, corsHeaders);
+      }
+
+      const conversationId = hideMessageMatch[1];
+      const messageId = hideMessageMatch[2];
+      const id = env.CHAT_ROOM.idFromName(conversationId);
+      const stub = env.CHAT_ROOM.get(id);
+
+      return forwardToDO(
+        stub,
+        "https://internal/hide-message",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId: auth.userId, messageId }),
+        },
+        corsHeaders
+      );
+    }
+
     // Delete conversation (destructive — removes for ALL members)
     const deleteConvMatch = url.pathname.match(
       /^\/conversations\/([^/]+)$/
@@ -1190,6 +1243,7 @@ export default {
 
       const mediaType = resourceType;
       const mediaUrl = (cloudinaryResult.secure_url as string) || (cloudinaryResult.url as string) || "";
+      const fileName = file.name || (cloudinaryResult.original_filename as string) || "unknown";
 
       return jsonResponse(
         {
@@ -1202,7 +1256,11 @@ export default {
             mediaUrl,
             mediaType,
             mimeType: file.type,
-            fileName: file.name || "unknown",
+            fileName,
+            fileSize: file.size,
+            ...(cloudinaryResult.width ? { width: cloudinaryResult.width } : {}),
+            ...(cloudinaryResult.height ? { height: cloudinaryResult.height } : {}),
+            ...(cloudinaryResult.duration ? { duration: cloudinaryResult.duration } : {}),
           },
         },
         200,

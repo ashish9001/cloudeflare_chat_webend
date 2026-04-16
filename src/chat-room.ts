@@ -19,6 +19,7 @@ const MAX_METADATA_SIZE = 2048; // 2KB max metadata JSON
 const RATE_LIMIT_WINDOW_MS = 10_000; // 10 seconds
 const RATE_LIMIT_MAX_MESSAGES = 10; // max 10 messages per window
 const TYPING_TIMEOUT_MS = 5_000; // 5 seconds typing indicator timeout
+const TYPING_COOLDOWN_MS = 3_000; // 3 seconds cooldown between typing broadcasts per user
 const MAX_SEND_FAILURES = 3; // close WS after this many consecutive failures
 const MAX_GROUP_MEMBERS = 256; // max members in a group conversation
 
@@ -29,6 +30,9 @@ export class ChatRoom extends DurableObject<Env> {
   // Typing state: userId -> expiry timestamp (ms). Avoids setTimeout which is
   // unreliable under the Durable Object Hibernation API.
   private typingExpiry = new Map<string, number>();
+  // Typing cooldown: userId -> last broadcast timestamp (ms). Drops rapid typing
+  // events server-side so misbehaving clients can't spam participants.
+  private typingCooldown = new Map<string, number>();
   // Track consecutive send failures per WebSocket
   private sendFailures = new WeakMap<WebSocket, number>();
 
@@ -83,6 +87,14 @@ export class ChatRoom extends DurableObject<Env> {
 
       if (url.pathname === "/hide-for-user" && request.method === "POST") {
         return await this.handleHideForUser(request);
+      }
+
+      if (url.pathname === "/clear-chat" && request.method === "POST") {
+        return await this.handleClearChat(request);
+      }
+
+      if (url.pathname === "/hide-message" && request.method === "POST") {
+        return await this.handleHideMessage(request);
       }
 
       if (url.pathname === "/mute" && request.method === "POST") {
@@ -157,8 +169,10 @@ export class ChatRoom extends DurableObject<Env> {
 
     for (const userId of body.memberIds) {
       const role = userId === body.creatorId ? "admin" : "member";
+      // ON CONFLICT: preserve existing deleted_at so old messages stay hidden
+      // after a user re-enters a conversation they previously left/hid.
       this.sql.exec(
-        "INSERT OR IGNORE INTO members (user_id, role, joined_at, last_read_index) VALUES (?, ?, ?, ?)",
+        "INSERT INTO members (user_id, role, joined_at, last_read_index) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET role = excluded.role, joined_at = excluded.joined_at",
         userId,
         role,
         now,
@@ -251,6 +265,10 @@ export class ChatRoom extends DurableObject<Env> {
     // Schema migration: add muted column for per-user notification mute
     try {
       this.sql.exec("ALTER TABLE members ADD COLUMN muted INTEGER DEFAULT 0");
+    } catch { /* column already exists */ }
+    // Schema migration: add deleted_by JSON array for per-user single-message hide
+    try {
+      this.sql.exec("ALTER TABLE messages ADD COLUMN deleted_by TEXT DEFAULT '[]'");
     } catch { /* column already exists */ }
   }
 
@@ -368,6 +386,10 @@ export class ChatRoom extends DurableObject<Env> {
       params.push(memberDeletedAt);
     }
 
+    // Per-message hide: exclude messages where this user is in deleted_by array
+    query += " AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(deleted_by, '[]')) WHERE value = ?)";
+    params.push(userId);
+
     if (before) {
       let beforeTs: number;
       // Support both message ID format (msg_{timestamp}_{uuid}) and raw timestamp
@@ -472,9 +494,12 @@ export class ChatRoom extends DurableObject<Env> {
       /* user may not be in members yet */
     }
 
+    // Reusable per-message hide filter clause
+    const deletedByFilter = "AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(deleted_by, '[]')) WHERE value = ?)";
+
     // Total message count (for messageCount field in response)
-    let totalCountQuery = "SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL";
-    const totalCountParams: (string | number)[] = [];
+    let totalCountQuery = `SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL ${deletedByFilter}`;
+    const totalCountParams: (string | number)[] = [userId];
     if (memberDeletedAt !== null) {
       totalCountQuery += " AND created_at > ?";
       totalCountParams.push(memberDeletedAt);
@@ -490,7 +515,8 @@ export class ChatRoom extends DurableObject<Env> {
       ? Math.max(lastReadIndex, memberDeletedAt)
       : lastReadIndex;
     const unreadCursor = this.sql.exec(
-      "SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL AND created_at > ? AND sender_id != ?",
+      `SELECT COUNT(*) as cnt FROM messages WHERE deleted_at IS NULL ${deletedByFilter} AND created_at > ? AND sender_id != ?`,
+      userId,
       unreadThreshold,
       userId
     );
@@ -499,7 +525,8 @@ export class ChatRoom extends DurableObject<Env> {
     let lastUnreadMessage: MessagePayload | null = null;
     if (unreadCount > 0) {
       const lastMsgCursor = this.sql.exec(
-        "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL AND created_at > ? AND sender_id != ? ORDER BY created_at DESC LIMIT 1",
+        `SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL ${deletedByFilter} AND created_at > ? AND sender_id != ? ORDER BY created_at DESC LIMIT 1`,
+        userId,
         unreadThreshold,
         userId
       );
@@ -534,8 +561,8 @@ export class ChatRoom extends DurableObject<Env> {
     let lastMessage: MessagePayload | null = null;
     {
       const lmThreshold = memberDeletedAt ?? 0;
-      const lmQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL AND created_at > ? ORDER BY created_at DESC LIMIT 1";
-      const lmCursor = this.sql.exec(lmQuery, lmThreshold);
+      const lmQuery = `SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL ${deletedByFilter} AND created_at > ? ORDER BY created_at DESC LIMIT 1`;
+      const lmCursor = this.sql.exec(lmQuery, userId, lmThreshold);
       const lmRow = lmCursor.one() as {
         id: string;
         sender_id: string;
@@ -1248,10 +1275,15 @@ export class ChatRoom extends DurableObject<Env> {
 
     this.ensureSchema();
 
-    // Remove the member row entirely (unjoin).
-    // When they send a message again, createConversation → handleInit
-    // re-inserts them via INSERT OR IGNORE.
-    this.sql.exec("DELETE FROM members WHERE user_id = ?", body.userId);
+    // Set deleted_at to hide all existing messages for this user.
+    // We keep the member row (instead of deleting it) so that when the user
+    // re-enters the conversation, getHistory filters messages before deleted_at.
+    const now = Date.now();
+    this.sql.exec(
+      "UPDATE members SET deleted_at = ? WHERE user_id = ?",
+      now,
+      body.userId
+    );
 
     // Close any active WebSocket connections for this user
     const userTag = `${USER_TAG_PREFIX}${body.userId}`;
@@ -1259,6 +1291,106 @@ export class ChatRoom extends DurableObject<Env> {
       try {
         ws.close(4004, "Left conversation");
       } catch { /* already closed */ }
+    }
+
+    return new Response(
+      JSON.stringify({ ok: true }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // ============ Clear Chat (per-user: hides all messages before now) ============
+
+  private async handleClearChat(request: Request): Promise<Response> {
+    let body: { userId: string };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON body" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!body.userId) {
+      return new Response(
+        JSON.stringify({ error: "userId required" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    this.ensureSchema();
+
+    if (!this.isMember(body.userId)) {
+      return new Response(
+        JSON.stringify({ error: "Not a member of this conversation" }),
+        { status: 403, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const now = Date.now();
+    this.sql.exec(
+      "UPDATE members SET deleted_at = ? WHERE user_id = ?",
+      now,
+      body.userId
+    );
+
+    return new Response(
+      JSON.stringify({ ok: true, clearedAt: now }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // ============ Hide Message (per-user: hides a single message for requesting user) ============
+
+  private async handleHideMessage(request: Request): Promise<Response> {
+    let body: { userId: string; messageId: string };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON body" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!body.userId || !body.messageId) {
+      return new Response(
+        JSON.stringify({ error: "userId and messageId required" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    this.ensureSchema();
+
+    if (!this.isMember(body.userId)) {
+      return new Response(
+        JSON.stringify({ error: "Not a member of this conversation" }),
+        { status: 403, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Check message exists
+    const msgRow = this.sql
+      .exec("SELECT deleted_by FROM messages WHERE id = ?", body.messageId)
+      .toArray() as Array<{ deleted_by: string | null }>;
+
+    if (msgRow.length === 0) {
+      return new Response(
+        JSON.stringify({ error: "Message not found" }),
+        { status: 404, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Append userId to deleted_by JSON array (idempotent — skip if already present)
+    const existing: string[] = JSON.parse(msgRow[0].deleted_by || "[]");
+    if (!existing.includes(body.userId)) {
+      existing.push(body.userId);
+      this.sql.exec(
+        "UPDATE messages SET deleted_by = ? WHERE id = ?",
+        JSON.stringify(existing),
+        body.messageId
+      );
     }
 
     return new Response(
@@ -1423,14 +1555,24 @@ export class ChatRoom extends DurableObject<Env> {
       console.error("Failed to update presence on connect:", e);
     }
 
-    // Sync recent messages (respecting per-user soft delete cutoff)
+    // Sync recent messages (respecting per-user soft delete cutoff + per-message hide)
+    // If client provides lastSeenTs, only send messages newer than that timestamp
+    // (server-side dedup — avoids resending messages the client already has on reconnect)
+    const lastSeenTs = parseInt(url.searchParams.get("lastSeenTs") || "0", 10) || 0;
+
     try {
       const memberDeletedAt = this.getMemberDeletedAt(userId);
-      let syncQuery = "SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL";
-      const syncParams: (string | number)[] = [];
+      const deletedByFilter = "AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(deleted_by, '[]')) WHERE value = ?)";
+      let syncQuery = `SELECT id, sender_id, content, message_type, created_at, edited_at, metadata, reply_to_id FROM messages WHERE deleted_at IS NULL ${deletedByFilter}`;
+      const syncParams: (string | number)[] = [userId];
       if (memberDeletedAt !== null) {
         syncQuery += " AND created_at > ?";
         syncParams.push(memberDeletedAt);
+      }
+      // Use the later of lastSeenTs and memberDeletedAt as the lower bound
+      if (lastSeenTs > 0) {
+        syncQuery += " AND created_at > ?";
+        syncParams.push(lastSeenTs);
       }
       syncQuery += " ORDER BY created_at DESC LIMIT 50";
       const recentCursor = this.sql.exec(syncQuery, ...syncParams);
@@ -1954,11 +2096,22 @@ export class ChatRoom extends DurableObject<Env> {
   // ============ Typing with timeout ============
 
   private handleTypingWithTimeout(ws: WebSocket, userId: string): void {
+    const now = Date.now();
+
+    // Server-side cooldown: drop rapid typing events (max 1 per 3s per user)
+    const lastBroadcast = this.typingCooldown.get(userId) ?? 0;
+    if (now - lastBroadcast < TYPING_COOLDOWN_MS) {
+      // Still within cooldown — extend expiry but don't broadcast again
+      this.typingExpiry.set(userId, now + TYPING_TIMEOUT_MS);
+      return;
+    }
+
     // Broadcast typing start
+    this.typingCooldown.set(userId, now);
     this.broadcastExcept(ws, { type: "typing", userId });
 
     // Store expiry timestamp (no setTimeout — survives DO hibernation)
-    this.typingExpiry.set(userId, Date.now() + TYPING_TIMEOUT_MS);
+    this.typingExpiry.set(userId, now + TYPING_TIMEOUT_MS);
   }
 
   /**
@@ -1977,6 +2130,7 @@ export class ChatRoom extends DurableObject<Env> {
   }
 
   private clearTyping(userId: string): void {
+    this.typingCooldown.delete(userId);
     if (this.typingExpiry.has(userId)) {
       this.typingExpiry.delete(userId);
       this.broadcast({ type: "typing_stopped", userId });
