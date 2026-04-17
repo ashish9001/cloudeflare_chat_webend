@@ -1848,6 +1848,10 @@ export class ChatRoom extends DurableObject<Env> {
     const conversationId = (await this.ctx.storage.get("conversation_id")) as string || "";
     const feature = (await this.ctx.storage.get("conversation_feature")) as string | undefined;
     this.notifyAllMembers(userId, msg.content, conversationId, feature);
+
+    // Auto-unhide: re-add conversation to UserSession for members who hid it.
+    // Makes hidden conversations reappear when a new message arrives (WhatsApp-style).
+    this.unhideForHiddenMembers(conversationId, feature);
   }
 
   /**
@@ -1968,6 +1972,87 @@ export class ChatRoom extends DurableObject<Env> {
 
     // waitUntil keeps the DO alive until all pushes complete, without blocking the handler
     this.ctx.waitUntil(pushJob());
+  }
+
+  /**
+   * Re-add conversation to UserSession for members who previously hid it.
+   * Called after every new message so hidden conversations reappear automatically.
+   * Uses ctx.waitUntil() so it doesn't block the message handler.
+   */
+  private unhideForHiddenMembers(conversationId: string, feature?: string): void {
+    const hiddenMembers = this.sql
+      .exec("SELECT user_id FROM members WHERE deleted_at IS NOT NULL")
+      .toArray() as Array<{ user_id: string }>;
+
+    if (hiddenMembers.length === 0) return;
+
+    const allMembers = this.sql
+      .exec("SELECT user_id FROM members")
+      .toArray() as Array<{ user_id: string }>;
+
+    const hiddenSet = new Set(hiddenMembers.map((m) => m.user_id));
+    const sourceUserId = allMembers.find((m) => !hiddenSet.has(m.user_id))?.user_id;
+
+    console.log(`[UNHIDE] ${hiddenMembers.length} hidden member(s) in convId=${conversationId}, source=${sourceUserId || "none"}`);
+
+    const unhideJob = async () => {
+      let participants: ConversationParticipant[] | undefined;
+      let convType: string | undefined;
+      let convName: string | undefined;
+
+      // Fetch participant data from a non-hidden member's UserSession
+      if (sourceUserId) {
+        try {
+          const stub = this.env.USER_SESSION.get(
+            this.env.USER_SESSION.idFromName(`user_${sourceUserId}`)
+          );
+          const res = await stub.fetch(
+            `https://internal/conversations?userId=${encodeURIComponent(sourceUserId)}`
+          );
+          if (res.ok) {
+            const data = (await res.json()) as {
+              conversations: Array<{
+                conversationId: string;
+                type?: string;
+                name?: string;
+                participants?: ConversationParticipant[];
+              }>;
+            };
+            const conv = data.conversations.find((c) => c.conversationId === conversationId);
+            if (conv) {
+              participants = conv.participants;
+              convType = conv.type;
+              convName = conv.name;
+            }
+          }
+        } catch (e) {
+          console.error(`[UNHIDE] Failed to fetch participants from source user ${sourceUserId}:`, e);
+        }
+      }
+
+      for (const member of hiddenMembers) {
+        try {
+          const stub = this.env.USER_SESSION.get(
+            this.env.USER_SESSION.idFromName(`user_${member.user_id}`)
+          );
+          await stub.fetch("https://internal/conversations/add", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              conversationId,
+              type: convType,
+              name: convName,
+              feature: feature || undefined,
+              participants: participants,
+            }),
+          });
+        } catch (e) {
+          console.error(`[UNHIDE] Failed for userId=${member.user_id}:`, e);
+        }
+      }
+    };
+
+    this.ctx.waitUntil(unhideJob());
   }
 
   private handleEditMessage(
