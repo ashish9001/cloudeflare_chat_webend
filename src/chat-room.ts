@@ -61,6 +61,10 @@ export class ChatRoom extends DurableObject<Env> {
         return this.handleListMembers();
       }
 
+      if (url.pathname === "/stored-participants" && request.method === "GET") {
+        return this.handleGetStoredParticipants();
+      }
+
       if (url.pathname === "/members/add" && request.method === "POST") {
         return await this.handleAddMembers(request);
       }
@@ -186,6 +190,11 @@ export class ChatRoom extends DurableObject<Env> {
     if (body.feature) {
       await this.ctx.storage.put("conversation_feature", body.feature);
     }
+
+    // Store participants locally so unhideForHiddenMembers can restore them
+    // without making expensive cross-DO calls.
+    const participantsToStore = body.participants || body.memberIds.map((id) => ({ userId: id }));
+    await this.ctx.storage.put("conversation_participants", JSON.stringify(participantsToStore));
 
     // Register this conversation in each member's UserSession.
     // INSERT OR IGNORE in UserSession.handleAddConversation re-adds the conversation
@@ -627,6 +636,22 @@ export class ChatRoom extends DurableObject<Env> {
           lastReadIndex: m.last_read_index ?? 0,
         })),
       }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  /** Return participant data stored in DO storage at conversation init time. */
+  private async handleGetStoredParticipants(): Promise<Response> {
+    let participants: ConversationParticipant[] = [];
+    try {
+      const stored = await this.ctx.storage.get("conversation_participants") as string | undefined;
+      if (stored) {
+        participants = JSON.parse(stored) as ConversationParticipant[];
+      }
+    } catch { /* no stored participants */ }
+
+    return new Response(
+      JSON.stringify({ participants }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
@@ -1986,49 +2011,57 @@ export class ChatRoom extends DurableObject<Env> {
 
     if (hiddenMembers.length === 0) return;
 
+    console.log(`[UNHIDE] ${hiddenMembers.length} hidden member(s) in convId=${conversationId}`);
+
+    // NOTE: Do NOT clear deleted_at here. It doubles as the per-user message
+    // cutoff filter (getHistory/getSummary only show messages after deleted_at).
+    // Clearing it would expose old messages that the user already "deleted".
+    // Re-triggering on each message is acceptable — the logic is now lightweight
+    // (local DO storage read + single UserSession call).
+
     const allMembers = this.sql
       .exec("SELECT user_id FROM members")
       .toArray() as Array<{ user_id: string }>;
-
     const hiddenSet = new Set(hiddenMembers.map((m) => m.user_id));
     const sourceUserId = allMembers.find((m) => !hiddenSet.has(m.user_id))?.user_id;
 
-    console.log(`[UNHIDE] ${hiddenMembers.length} hidden member(s) in convId=${conversationId}, source=${sourceUserId || "none"}`);
-
     const unhideJob = async () => {
+      // 1. Read participant data from local DO storage (stored at conversation init)
       let participants: ConversationParticipant[] | undefined;
-      let convType: string | undefined;
-      let convName: string | undefined;
+      try {
+        const stored = await this.ctx.storage.get("conversation_participants") as string | undefined;
+        if (stored) {
+          participants = JSON.parse(stored) as ConversationParticipant[];
+        }
+      } catch (e) {
+        console.error(`[UNHIDE] Failed to read stored participants:`, e);
+      }
 
-      // Fetch participant data from a non-hidden member's UserSession
-      if (sourceUserId) {
+      // 2. Fallback for old conversations created before participant storage:
+      //    fetch from a non-hidden member's UserSession using lightweight endpoint
+      if ((!participants || participants.length === 0) && sourceUserId) {
         try {
           const stub = this.env.USER_SESSION.get(
             this.env.USER_SESSION.idFromName(`user_${sourceUserId}`)
           );
           const res = await stub.fetch(
-            `https://internal/conversations?userId=${encodeURIComponent(sourceUserId)}`
+            `https://internal/conversations/participants?conversationId=${encodeURIComponent(conversationId)}`
           );
           if (res.ok) {
-            const data = (await res.json()) as {
-              conversations: Array<{
-                conversationId: string;
-                type?: string;
-                name?: string;
-                participants?: ConversationParticipant[];
-              }>;
-            };
-            const conv = data.conversations.find((c) => c.conversationId === conversationId);
-            if (conv) {
-              participants = conv.participants;
-              convType = conv.type;
-              convName = conv.name;
+            const data = (await res.json()) as { participants: ConversationParticipant[] };
+            if (data.participants && data.participants.length > 0) {
+              participants = data.participants;
+              // Backfill local storage so future unhides are fast
+              await this.ctx.storage.put("conversation_participants", JSON.stringify(participants));
             }
           }
         } catch (e) {
-          console.error(`[UNHIDE] Failed to fetch participants from source user ${sourceUserId}:`, e);
+          console.error(`[UNHIDE] Fallback fetch from source user ${sourceUserId} failed:`, e);
         }
       }
+
+      const convType = (await this.ctx.storage.get("conversation_type")) as string | undefined;
+      const convName = (await this.ctx.storage.get("conversation_name")) as string | undefined;
 
       for (const member of hiddenMembers) {
         try {

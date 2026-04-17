@@ -96,6 +96,11 @@ export class UserSession extends DurableObject<Env> {
       return this.handleRemoveParticipant(request);
     }
 
+    // Lightweight endpoint: return participants for a single conversation
+    if (url.pathname === "/conversations/participants" && request.method === "GET") {
+      return this.handleGetParticipants(url);
+    }
+
     return new Response("Not found", { status: 404 });
   }
 
@@ -233,7 +238,7 @@ export class UserSession extends DurableObject<Env> {
           image: string | null;
         }>;
 
-        const participants = partRows.map((p) => ({
+        let participants = partRows.map((p) => ({
           userId: p.user_id,
           name: p.name ?? undefined,
           email: p.email ?? undefined,
@@ -259,9 +264,9 @@ export class UserSession extends DurableObject<Env> {
           editedAt?: number;
           metadata?: Record<string, unknown>;
         } | null = null;
+        const chatRoomId = this.env.CHAT_ROOM.idFromName(conv.conversation_id);
+        const stub = this.env.CHAT_ROOM.get(chatRoomId);
         try {
-          const chatRoomId = this.env.CHAT_ROOM.idFromName(conv.conversation_id);
-          const stub = this.env.CHAT_ROOM.get(chatRoomId);
           const summaryUrl = `https://internal/summary?userId=${encodeURIComponent(userId)}`;
           const res = await stub.fetch(summaryUrl);
           if (res.ok) {
@@ -292,6 +297,36 @@ export class UserSession extends DurableObject<Env> {
           }
         } catch {
           /* ChatRoom may not be initialized; keep defaults */
+        }
+
+        // Backfill: if local participants are empty, fetch from ChatRoom's stored data
+        // and persist locally so future calls are fast.
+        if (participants.length === 0) {
+          try {
+            const pRes = await stub.fetch("https://internal/stored-participants");
+            if (pRes.ok) {
+              const pData = (await pRes.json()) as { participants: Array<{ userId: string; name?: string; email?: string; image?: string }> };
+              if (pData.participants && pData.participants.length > 0) {
+                participants = pData.participants.map((p) => ({
+                  userId: p.userId,
+                  name: p.name ?? undefined,
+                  email: p.email ?? undefined,
+                  image: p.image ?? undefined,
+                }));
+                // Backfill into local DB
+                for (const p of pData.participants) {
+                  this.sql.exec(
+                    "INSERT OR REPLACE INTO conversation_participants (conversation_id, user_id, name, email, image) VALUES (?, ?, ?, ?, ?)",
+                    conv.conversation_id,
+                    p.userId,
+                    p.name || null,
+                    p.email || null,
+                    p.image || null
+                  );
+                }
+              }
+            }
+          } catch { /* best-effort backfill */ }
         }
 
         return {
@@ -540,6 +575,35 @@ export class UserSession extends DurableObject<Env> {
     );
 
     return new Response(JSON.stringify({ ok: true }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  /** Lightweight: return participants for a single conversation (no ChatRoom summary calls). */
+  private handleGetParticipants(url: URL): Response {
+    const conversationId = url.searchParams.get("conversationId");
+    if (!conversationId) {
+      return new Response(
+        JSON.stringify({ error: "conversationId query param required" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    this.ensureConversationSchema();
+
+    const partRows = this.sql.exec(
+      "SELECT user_id, name, email, image FROM conversation_participants WHERE conversation_id = ? ORDER BY user_id ASC",
+      conversationId
+    ).toArray() as Array<{ user_id: string; name: string | null; email: string | null; image: string | null }>;
+
+    const participants = partRows.map((p) => ({
+      userId: p.user_id,
+      name: p.name ?? undefined,
+      email: p.email ?? undefined,
+      image: p.image ?? undefined,
+    }));
+
+    return new Response(JSON.stringify({ participants }), {
       headers: { "Content-Type": "application/json" },
     });
   }

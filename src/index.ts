@@ -699,13 +699,13 @@ export default {
           return jsonResponse(hideResult, hideResp.status, corsHeaders);
         }
 
-        // 2. Remove conversation from UserSession (no longer in user's list)
+        // 2. Soft-delete conversation from UserSession (preserves participants for unhide)
         const userSessionId = env.USER_SESSION.idFromName(`user_${auth.userId}`);
         const userSessionStub = env.USER_SESSION.get(userSessionId);
-        await userSessionStub.fetch("https://internal/conversations/remove", {
+        await userSessionStub.fetch("https://internal/conversations/hide", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ conversationId }),
+          body: JSON.stringify({ conversationId, deletedAt: Date.now() }),
         });
 
         return jsonResponse(
