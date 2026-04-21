@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- `npm run dev` — Start local dev server (wrangler dev)
+- `npm run dev` — Start local dev server (`wrangler dev --ip 0.0.0.0`, LAN-accessible on `:8787`)
 - `npm run deploy` — Deploy to Cloudflare production
 - `npm run deploy:staging` — Deploy to staging (`cloudflare-chat-staging`)
+- `npm run tail` — Stream logs from the deployed Worker (`wrangler tail`)
 - `npm run typecheck` — Run TypeScript type checking (`tsc --noEmit`)
 - No test framework is configured; there are no tests.
 
@@ -26,7 +27,7 @@ Each DO extends `DurableObject<Env>` from `cloudflare:workers`. Schema created l
 
 - **UserSession** (`src/user-session.ts`) — One per user (`user_{userId}`). Presence with **connection counting** — tracks which conversations user is connected to, only marks offline when all connections drop. 15-min auto-offline via DO alarm. Stores conversation list with participant metadata in SQLite.
 
-- **NotificationRouter** (`src/notification-router.ts`) — One per user. Stores up to 5 device tokens. **Actually sends push** to FCM (Android) and APNs (iOS) with token-based JWT auth. Auto-removes invalid tokens on send failure.
+- **NotificationRouter** (`src/notification-router.ts`) — One per user. Stores up to 5 device tokens. **Actually sends push** to FCM HTTP v1 (Android, OAuth2 access token minted from a service-account JWT signed with `FCM_PRIVATE_KEY`) and APNs (iOS, token-based JWT auth). Auto-removes invalid tokens on send failure.
 
 - **CallSignaling** (`src/call-signaling.ts`) — One per call. Full lifecycle: initiate → ring (with push to callee) → accept/reject → hangup. 30-second ring timeout via alarm. WebRTC signaling relay (offer/answer/ICE). STUN servers always included; TURN with time-limited credentials if `TURN_SECRET`/`TURN_SERVER_URL` configured.
 
@@ -49,20 +50,31 @@ DOs call each other via internal `fetch()`:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| POST | `/conversations` | Create DM or group |
-| GET | `/conversations/:id/history` | Message history (cursor) |
+| POST | `/conversations` | Create DM or group (accepts client-supplied `name` as conversationId for custom-prefixed DMs) |
+| GET | `/conversations/:id/history` | Message history (cursor via `before`, max `limit=100`) |
+| GET | `/conversations/:id/summary` | messageCount + caller's lastReadIndex |
 | GET | `/conversations/:id/members` | List members |
 | POST | `/conversations/:id/members` | Add members (admin only) |
 | POST | `/conversations/:id/members/remove` | Remove members (admin only) |
+| POST | `/conversations/:id/members/role` | Promote/demote member (admin only) |
 | POST | `/conversations/:id/leave` | Leave group |
+| POST | `/conversations/:id/mute` / `/unmute` | Per-user mute state |
+| POST | `/conversations/:id/hide` | Per-user unjoin (swipe-to-delete): removes caller from ChatRoom members + soft-deletes in UserSession |
+| POST | `/conversations/:id/clear` | Per-user clear chat (hides all existing messages for caller) |
+| POST | `/conversations/:id/messages/:messageId/hide` | Per-user hide of a single message |
 | PUT | `/conversations/:id` | Update group (name) |
+| DELETE | `/conversations/:id` | Destructive delete for ALL members; also purges R2 media under `{conversationId}/` |
 | GET | `/users/:id/conversations` | List user's conversations (own only) |
 | GET | `/users/:id/presence` | Get presence |
+| POST | `/users/presence/batch` | Bulk presence lookup |
 | POST | `/devices` | Register push device |
 | POST | `/devices/unregister` | Unregister push device |
 | POST | `/calls` | Initiate a call |
 | GET | `/calls/:id` | Get call status |
+| POST | `/calls/:id/reject` | Reject incoming call |
 | GET | `/calls/ice-servers` | Get ICE/TURN servers |
+| POST | `/media/upload` | Cloudinary signed-upload passthrough (resource type via `?resource_type=`) |
+| POST | `/test-push` | Dev-only: send a test push to the caller's registered devices |
 
 ## WebSocket Endpoints
 
@@ -72,11 +84,14 @@ DOs call each other via internal `fetch()`:
 ## Environment & Secrets
 
 Set via `wrangler secret put`:
-- `AUTH_SECRET` — Enables JWT verification (omit for dev mode)
-- `FCM_SERVER_KEY` — Android push via FCM
+- `AUTH_SECRET` — Enables JWT verification (omit for dev mode, where the bearer token is used as the userId)
+- `FCM_PROJECT_ID`, `FCM_CLIENT_EMAIL`, `FCM_PRIVATE_KEY` — Android push via FCM HTTP v1 (service-account credentials from Firebase Console → Project Settings → Service accounts). `FCM_PRIVATE_KEY` must be valid PEM.
 - `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`, `APNS_PRIVATE_KEY` — iOS push via APNs
-- `TURN_SECRET`, `TURN_SERVER_URL` — TURN server for calls
+- `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` — Signed uploads for `/media/upload`
+- `TURN_SECRET`, `TURN_SERVER_URL` — TURN server for calls (STUN is always included even without these)
 - `ALLOWED_ORIGINS` — Comma-separated CORS origins (omit to allow all)
+
+R2 bucket `MEDIA_BUCKET` is an optional binding in `wrangler.toml`; if present, media files keyed by `{conversationId}/...` are purged on conversation DELETE.
 
 ## Agent Behavior Rules
 
