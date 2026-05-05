@@ -754,6 +754,7 @@ export class ChatRoom extends DurableObject<Env> {
             this.env.USER_SESSION.idFromName(`user_${userId}`)
           );
           const convName = await this.ctx.storage.get("conversation_name");
+          const convFeature = await this.ctx.storage.get("conversation_feature");
           await stub.fetch("https://internal/conversations/add", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -761,6 +762,7 @@ export class ChatRoom extends DurableObject<Env> {
               conversationId: body.conversationId,
               type: "group",
               name: convName,
+              feature: convFeature || undefined,
               createdAt: now,
               participants: fullParticipantsForNewMember,
             }),
