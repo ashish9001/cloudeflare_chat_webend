@@ -8,6 +8,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env, CallState } from "./types";
 
 const USER_TAG_PREFIX = "user:";
+const ROOM_TAG = "room";
 const CALL_RING_TIMEOUT_MS = 30_000; // 30 seconds to answer
 
 interface CallMetadata {
@@ -66,8 +67,13 @@ export class CallSignaling extends DurableObject<Env> {
     iceServers.push({ urls: "stun:stun.l.google.com:19302" });
     iceServers.push({ urls: "stun:stun1.l.google.com:19302" });
 
-    // Add TURN server if configured
-    if (this.env.TURN_SERVER_URL && this.env.TURN_SECRET) {
+    // Preferred: Cloudflare Realtime TURN (managed) — short-lived credentials
+    // generated via REST and cached in DO storage to avoid per-join API calls.
+    if (this.env.CF_TURN_KEY_ID && this.env.CF_TURN_API_TOKEN) {
+      const cfTurn = await this.getCloudflareTurnServers();
+      if (cfTurn) iceServers.push(cfTurn);
+    } else if (this.env.TURN_SERVER_URL && this.env.TURN_SECRET) {
+      // Fallback: classic coturn-style static-auth-secret TURN
       const username = `${Math.floor(Date.now() / 1000) + 86400}:cloudflare-chat`;
       const credential = await this.generateTurnCredential(username);
       iceServers.push({
@@ -81,6 +87,55 @@ export class CallSignaling extends DurableObject<Env> {
       JSON.stringify({ iceServers }),
       { headers: { "Content-Type": "application/json" } }
     );
+  }
+
+  /**
+   * Fetch (or reuse cached) Cloudflare Realtime TURN credentials.
+   * Credentials are issued with a 24h TTL and cached for 4h, so every
+   * member joining the same call/room reuses one credential set.
+   */
+  private async getCloudflareTurnServers(): Promise<{ urls: string[]; username: string; credential: string } | null> {
+    const CACHE_KEY = "cf_turn_cache";
+    const CACHE_MS = 4 * 60 * 60 * 1000;
+
+    try {
+      const cached = (await this.ctx.storage.get(CACHE_KEY)) as
+        | { fetchedAt: number; servers: { urls: string[]; username: string; credential: string } }
+        | undefined;
+      if (cached && Date.now() - cached.fetchedAt < CACHE_MS) {
+        return cached.servers;
+      }
+
+      const resp = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${this.env.CF_TURN_KEY_ID}/credentials/generate`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.env.CF_TURN_API_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ ttl: 86400 }),
+        }
+      );
+      if (!resp.ok) {
+        console.error(`Cloudflare TURN credential request failed: ${resp.status}`);
+        return null;
+      }
+      const data = (await resp.json()) as {
+        iceServers?: { urls?: string[]; username?: string; credential?: string };
+      };
+      const ice = data.iceServers;
+      if (!ice?.urls?.length || !ice.username || !ice.credential) {
+        console.error("Cloudflare TURN credential response malformed");
+        return null;
+      }
+      const servers = { urls: ice.urls, username: ice.username, credential: ice.credential };
+      await this.ctx.storage.put(CACHE_KEY, { fetchedAt: Date.now(), servers });
+      return servers;
+    } catch (e) {
+      console.error("Cloudflare TURN credential fetch error:", e);
+      return null;
+    }
   }
 
   /**
@@ -252,8 +307,47 @@ export class CallSignaling extends DurableObject<Env> {
       });
     }
 
+    // Room mode (meeting semantics): no ringing/accept lifecycle, no push.
+    // Members connect to a shared channel; the DO tracks presence and relays
+    // WebRTC signaling. Used by the video_conference module.
+    const isRoom = url.searchParams.get("room") === "1";
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+
+    if (isRoom) {
+      const displayName = url.searchParams.get("name") || userId;
+
+      // Snapshot existing distinct members BEFORE accepting the new socket
+      const existingMembers = this.roomMembers();
+      const isRejoin = existingMembers.some((m) => m.userId === userId);
+
+      this.ctx.acceptWebSocket(server, [`${USER_TAG_PREFIX}${userId}`, ROOM_TAG]);
+      try {
+        server.serializeAttachment({ name: displayName });
+      } catch { /* ignore */ }
+
+      try {
+        server.send(JSON.stringify({
+          type: "room_participants",
+          participants: existingMembers.filter((m) => m.userId !== userId),
+        }));
+      } catch { /* ignore */ }
+
+      if (!isRejoin) {
+        this.broadcastRoomExcept(server, {
+          type: "participant_joined",
+          userId,
+          name: displayName,
+        });
+      }
+
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+        headers: { Upgrade: "websocket", Connection: "Upgrade" },
+      });
+    }
 
     this.ctx.acceptWebSocket(server, [`${USER_TAG_PREFIX}${userId}`]);
 
@@ -273,6 +367,63 @@ export class CallSignaling extends DurableObject<Env> {
       webSocket: client,
       headers: { Upgrade: "websocket", Connection: "Upgrade" },
     });
+  }
+
+  // ============ Room presence (meeting semantics) ============
+
+  /** Distinct members (userId + display name) with at least one open room socket. */
+  private roomMembers(): Array<{ userId: string; name: string }> {
+    const byId = new Map<string, string>();
+    for (const ws of this.ctx.getWebSockets(ROOM_TAG)) {
+      const tag = this.ctx.getTags(ws).find((t) => t.startsWith(USER_TAG_PREFIX));
+      if (!tag) continue;
+      const userId = tag.slice(USER_TAG_PREFIX.length);
+      if (byId.has(userId)) continue;
+      let name = userId;
+      try {
+        const attachment = ws.deserializeAttachment() as { name?: string } | null;
+        if (attachment?.name) name = attachment.name;
+      } catch { /* ignore */ }
+      byId.set(userId, name);
+    }
+    return [...byId].map(([userId, name]) => ({ userId, name }));
+  }
+
+  private broadcastRoomExcept(exclude: WebSocket, msg: unknown): void {
+    const str = JSON.stringify(msg);
+    for (const ws of this.ctx.getWebSockets(ROOM_TAG)) {
+      if (ws === exclude) continue;
+      try {
+        ws.send(str);
+      } catch (e) {
+        console.error("CallSignaling broadcastRoomExcept failed:", e);
+      }
+    }
+  }
+
+  /** Presence bookkeeping when a room socket goes away (close or error). */
+  private handleRoomSocketGone(ws: WebSocket): void {
+    const tags = this.ctx.getTags(ws);
+    if (!tags.includes(ROOM_TAG)) return;
+    const userTag = tags.find((t) => t.startsWith(USER_TAG_PREFIX));
+    if (!userTag) return;
+    const userId = userTag.slice(USER_TAG_PREFIX.length);
+
+    // Only announce departure when the user has no other open room socket
+    const stillConnected = this.ctx
+      .getWebSockets(`${USER_TAG_PREFIX}${userId}`)
+      .some((other) => other !== ws && this.ctx.getTags(other).includes(ROOM_TAG));
+    if (!stillConnected) {
+      this.broadcastRoomExcept(ws, { type: "participant_left", userId });
+    }
+  }
+
+  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
+    this.handleRoomSocketGone(ws);
+  }
+
+  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+    this.handleRoomSocketGone(ws);
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -296,6 +447,20 @@ export class CallSignaling extends DurableObject<Env> {
     const senderId = userTag ? userTag.slice(USER_TAG_PREFIX.length) : "unknown";
 
     const signalingType = msg.type as SignalingType;
+
+    // Room mode: on-demand roster resync so clients can self-heal after
+    // socket blips (the connect-time room_participants is otherwise the only
+    // authoritative snapshot they ever get).
+    if (msg.type === "room_sync") {
+      try {
+        const members = this.roomMembers();
+        ws.send(JSON.stringify({
+          type: "room_participants",
+          participants: members.filter((m) => m.userId !== senderId),
+        }));
+      } catch { /* ignore */ }
+      return;
+    }
 
     switch (signalingType) {
       case "offer":

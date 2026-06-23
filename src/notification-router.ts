@@ -20,10 +20,12 @@ interface DeviceRegistration {
   userId?: string;
   /** APNs bundle id (topic) for iOS, e.g. com.push.temp — used as apns-topic when sending. */
   signature?: string;
+  /** true = use api.sandbox.push.apple.com (iOS debug builds) */
+  sandbox?: boolean;
   registeredAt: number;
 }
 
-const MAX_DEVICES_PER_USER = 5;
+const MAX_DEVICES_PER_USER = 10;
 
 // Cached OAuth2 access token (shared across requests within the same DO instance)
 let cachedAccessToken: { token: string; expiresAt: number } | null = null;
@@ -63,6 +65,7 @@ export class NotificationRouter extends DurableObject<Env> {
       appId?: string;
       userId?: string;
       signature?: string;
+      sandbox?: boolean;
     };
     try {
       body = (await request.json()) as typeof body;
@@ -103,6 +106,7 @@ export class NotificationRouter extends DurableObject<Env> {
       appId: body.appId,
       userId: body.userId,
       signature: body.signature,
+      sandbox: body.sandbox,
       registeredAt: Date.now(),
     };
 
@@ -195,12 +199,24 @@ export class NotificationRouter extends DurableObject<Env> {
     }
 
     const devices = ((await this.ctx.storage.get("devices")) as DeviceRegistration[]) ?? [];
-    console.log(`[PUSH] handleSendPush: title="${payload.title}" body="${payload.body}" data=${JSON.stringify(payload.data)} deviceCount=${devices.length}`);
 
-    if (devices.length === 0) {
-      console.log(`[PUSH] No devices registered for this user — push skipped`);
+    // Optional platform restriction — ChatRoom sends platforms:["ios"] for members
+    // it sees as connected, so suspended iOS apps (half-open sockets) still get a
+    // push while Android keeps its skip-when-active behavior.
+    const targetDevices = payload.platforms?.length
+      ? devices.filter((d) => payload.platforms!.includes(d.platform))
+      : devices;
+
+    console.log(`[PUSH] handleSendPush: title="${payload.title}" body="${payload.body}" data=${JSON.stringify(payload.data)} deviceCount=${devices.length} targetCount=${targetDevices.length} platforms=${payload.platforms?.join(",") || "all"}`);
+
+    if (targetDevices.length === 0) {
+      console.log(`[PUSH] No matching devices for this user — push skipped`);
       return new Response(
-        JSON.stringify({ ok: true, sent: 0, reason: "no_devices" }),
+        JSON.stringify({
+          ok: true,
+          sent: 0,
+          reason: devices.length === 0 ? "no_devices" : "no_devices_for_platform",
+        }),
         { headers: { "Content-Type": "application/json" } }
       );
     }
@@ -208,7 +224,7 @@ export class NotificationRouter extends DurableObject<Env> {
     const results: Array<{ platform: string; success: boolean; error?: string }> = [];
     const invalidTokens: string[] = [];
 
-    for (const device of devices) {
+    for (const device of targetDevices) {
       console.log(`[PUSH] Sending to ${device.platform} device (token: ...${device.token.slice(-8)})`);
       try {
         if (device.platform === "android") {
@@ -219,11 +235,11 @@ export class NotificationRouter extends DurableObject<Env> {
           // For call_incoming, use VoIP push if voipToken is available
           const isCallPush = payload.data?.type === "call_incoming";
           if (isCallPush && device.voipToken) {
-            const result = await this.sendAPNs(device.voipToken, payload, device.signature, device.appId, "voip");
+            const result = await this.sendAPNs(device.voipToken, payload, device.signature, device.appId, "voip", device.sandbox);
             results.push({ platform: "ios-voip", success: result.success });
             if (result.invalidToken) invalidTokens.push(device.voipToken);
           } else {
-            const result = await this.sendAPNs(device.token, payload, device.signature, device.appId);
+            const result = await this.sendAPNs(device.token, payload, device.signature, device.appId, "alert", device.sandbox);
             results.push({ platform: "ios", success: result.success });
             if (result.invalidToken) invalidTokens.push(device.token);
           }
@@ -246,7 +262,7 @@ export class NotificationRouter extends DurableObject<Env> {
 
     const sent = results.filter((r) => r.success).length;
     return new Response(
-      JSON.stringify({ ok: true, sent, total: devices.length }),
+      JSON.stringify({ ok: true, sent, total: targetDevices.length }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
@@ -451,7 +467,9 @@ export class NotificationRouter extends DurableObject<Env> {
     /** Optional app id from registration (hex or legacy); not used as topic unless it looks like a bundle id. */
     deviceAppId?: string,
     /** Push type: "alert" (default) or "voip" for call notifications */
-    pushType: "alert" | "voip" = "alert"
+    pushType: "alert" | "voip" = "alert",
+    /** true = device registered from a debug build → route to sandbox APNs */
+    sandbox?: boolean
   ): Promise<{ success: boolean; invalidToken?: boolean }> {
     if (!this.env.APNS_KEY_ID || !this.env.APNS_TEAM_ID || !this.env.APNS_PRIVATE_KEY) {
       console.warn("APNs credentials not set, skipping iOS push");
@@ -475,8 +493,8 @@ export class NotificationRouter extends DurableObject<Env> {
 
     const apnsJwt = await this.generateAPNsJWT();
 
-    // Sandbox only for known debug bundle (tokens must match endpoint).
-    const isDebugBuild = apnsTopic === "com.pushtest.temp";
+    // Sandbox for debug builds (per-device flag) or known debug bundle.
+    const isDebugBuild = sandbox === true || apnsTopic === "com.pushtest.temp";
     const apnsHost = isDebugBuild
       ? "api.sandbox.push.apple.com"
       : "api.push.apple.com";
@@ -506,6 +524,17 @@ export class NotificationRouter extends DurableObject<Env> {
 
     console.log(`[PUSH] sendAPNs: host=${apnsHost} topic=${effectiveTopic} pushType=${pushType} token=...${deviceToken.slice(-8)}`);
 
+    // Call pushes are time-sensitive: a ring delivered late is useless, so let APNs
+    // discard them (expiration 0). Chat pushes must survive a temporarily unreachable
+    // device — expiration 0 disables store-and-forward and silently drops them
+    // (FCM retries by default, which is why Android delivery was reliable and iOS
+    // was not). Give chat pushes a 24h window.
+    const isCallPush =
+      pushType === "voip" || (payload.data?.type || "").startsWith("call_");
+    const apnsExpiration = isCallPush
+      ? "0"
+      : String(Math.floor(Date.now() / 1000) + 86400);
+
     const response = await fetch(apnsUrl, {
       method: "POST",
       headers: {
@@ -514,7 +543,7 @@ export class NotificationRouter extends DurableObject<Env> {
         "apns-topic": effectiveTopic,
         "apns-push-type": pushType,
         "apns-priority": "10",
-        "apns-expiration": "0",
+        "apns-expiration": apnsExpiration,
       },
       body: JSON.stringify(apnsPayload),
     });
@@ -523,8 +552,22 @@ export class NotificationRouter extends DurableObject<Env> {
       const text = await response.text();
       console.error(`APNs error (${response.status}): ${text}`);
 
-      // Token is invalid
-      if (response.status === 400 || response.status === 410) {
+      // Only prune tokens APNs explicitly declares dead. A blanket 400 also covers
+      // recoverable/config errors (TopicDisallowed, PayloadTooLarge, ...) — pruning
+      // on those permanently silences the device until the app re-registers.
+      let apnsReason = "";
+      try {
+        apnsReason = (JSON.parse(text) as { reason?: string }).reason || "";
+      } catch {
+        // non-JSON error body
+      }
+      const tokenIsDead =
+        response.status === 410 ||
+        apnsReason === "Unregistered" ||
+        apnsReason === "BadDeviceToken" ||
+        apnsReason === "DeviceTokenNotForTopic";
+      if (tokenIsDead) {
+        console.warn(`[PUSH] APNs token invalid (${apnsReason || response.status}) — marking for removal`);
         return { success: false, invalidToken: true };
       }
       return { success: false };

@@ -23,6 +23,10 @@ export interface Env {
   APNS_PRIVATE_KEY?: string;
   TURN_SECRET?: string;
   TURN_SERVER_URL?: string;
+  // Cloudflare Realtime TURN (managed) — preferred over the static-secret pair above.
+  // Create in dashboard: Realtime > TURN > Create app, then set both via wrangler secret.
+  CF_TURN_KEY_ID?: string;
+  CF_TURN_API_TOKEN?: string;
   ALLOWED_ORIGINS?: string; // comma-separated origins for CORS
 }
 
@@ -193,6 +197,9 @@ export interface MemberAddedPayload {
   type: "member_added";
   userId: string;
   addedBy: string;
+  name?: string;
+  email?: string;
+  image?: string;
 }
 
 export interface MemberRemovedPayload {
@@ -334,6 +341,8 @@ export interface PushNotificationPayload {
   title: string;
   body: string;
   data?: Record<string, string>;
+  /** Restrict delivery to these platforms (e.g. ["ios"]). Omitted = all devices. */
+  platforms?: Array<"android" | "ios">;
 }
 
 // ============ Call Types ============

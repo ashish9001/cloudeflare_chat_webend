@@ -226,7 +226,23 @@ Incoming calls are delivered via APNs. For CallKit on iOS you'll typically want 
 - **Cloudflare Calls TURN** — managed, also supports shared-secret REST format.
 - **Twilio Network Traversal Service** — different credential format; requires code changes.
 
-### 7.2 Set secrets (coturn-style)
+### 7.2 Cloudflare Realtime TURN (recommended, managed)
+
+1. Cloudflare dashboard -> **Realtime** -> **TURN** -> *Create TURN app* (any name).
+2. Copy the **TURN Key ID** and the **API token** it shows once.
+3. Set both secrets (repeat with `--env production` for the prod worker):
+
+```bash
+npx wrangler secret put CF_TURN_KEY_ID
+npx wrangler secret put CF_TURN_API_TOKEN
+```
+
+The worker then generates short-lived credentials at runtime
+(`rtc.live.cloudflare.com/v1/turn/keys/{id}/credentials/generate`, 24h TTL,
+cached 4h per signaling DO) and includes `turn.cloudflare.com` in
+`/calls/ice-servers`. No client changes needed.
+
+### 7.3 Set secrets (coturn-style, fallback)
 
 ```bash
 npx wrangler secret put TURN_SERVER_URL    # e.g. turn:turn.example.com:3478?transport=udp

@@ -869,23 +869,24 @@ export default {
       }
 
       const rawBody = await request.text();
+      let routerUserId = String(auth.userId);
       try {
         const parsed = JSON.parse(rawBody) as { userId?: string };
         const bodyUserId =
           parsed.userId != null ? String(parsed.userId).trim() : "";
-        if (bodyUserId.length > 0 && bodyUserId !== String(auth.userId)) {
-          return jsonResponse(
-            { error: "Forbidden: userId must match authenticated user" },
-            403,
-            corsHeaders
-          );
+        // Use body's numeric userId for the NotificationRouter key when available.
+        // The auth token may be a compound Twilio-era identity (e.g. "appId_email_socialnetworknew")
+        // while pushes are sent to the numeric userId. Prefer the numeric body userId so devices
+        // are stored under the same router that notifyAllMembers targets.
+        if (bodyUserId.length > 0) {
+          routerUserId = bodyUserId;
         }
       } catch {
         return jsonResponse({ error: "Invalid JSON body" }, 400, corsHeaders);
       }
 
-      console.log(`[DEVICES] POST /devices — registering device for userId=${auth.userId}`);
-      const id = env.NOTIFICATION_ROUTER.idFromName(`user_${auth.userId}`);
+      console.log(`[DEVICES] POST /devices — registering device for userId=${routerUserId} (auth=${auth.userId})`);
+      const id = env.NOTIFICATION_ROUTER.idFromName(`user_${routerUserId}`);
       const stub = env.NOTIFICATION_ROUTER.get(id);
       const doUrl = new URL(request.url);
       doUrl.pathname = "/register";
@@ -1058,6 +1059,7 @@ export default {
         callerName?: string;
         callerImage?: string;
         feature?: string;
+        callId?: string;
       };
       try {
         body = (await request.json()) as typeof body;
@@ -1072,7 +1074,13 @@ export default {
         return jsonResponse({ error: "callType must be 'voice' or 'video'" }, 400, corsHeaders);
       }
 
-      const callId = `call_${crypto.randomUUID()}`;
+      // Optional client-supplied callId lets callers derive a deterministic id
+      // (e.g. video-conference meeting rooms) so other parties can pre-connect
+      // to the same signaling channel without waiting for a push.
+      const callId =
+        body.callId && /^[A-Za-z0-9_-]{8,64}$/.test(body.callId)
+          ? body.callId
+          : `call_${crypto.randomUUID()}`;
       const id = env.CALL_SIGNALING.idFromName(callId);
       const stub = env.CALL_SIGNALING.get(id);
       const doUrl = new URL(request.url);
@@ -1175,12 +1183,37 @@ export default {
 
       // Validate file type
       const allowedTypes: Record<string, string> = {
+        // Images
         "image/jpeg": "jpg",
         "image/png": "png",
         "image/gif": "gif",
         "image/webp": "webp",
+        // Videos
         "video/mp4": "mp4",
         "video/quicktime": "mov",
+        // Audio
+        "audio/mpeg": "mp3",
+        "audio/mp3": "mp3",
+        "audio/mp4": "m4a",
+        "audio/x-m4a": "m4a",
+        "audio/m4a": "m4a",
+        "audio/aac": "aac",
+        "audio/wav": "wav",
+        "audio/x-wav": "wav",
+        "audio/ogg": "ogg",
+        // Documents / files
+        "application/pdf": "pdf",
+        "application/msword": "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "application/vnd.ms-excel": "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+        "application/vnd.ms-powerpoint": "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+        "application/zip": "zip",
+        "application/x-zip-compressed": "zip",
+        "application/octet-stream": "bin",
+        "text/plain": "txt",
+        "text/csv": "csv",
       };
       const ext = allowedTypes[file.type];
       if (!ext) {
@@ -1191,11 +1224,12 @@ export default {
         );
       }
 
-      // Validate size (5MB max)
-      const MAX_SIZE = 5 * 1024 * 1024;
+      // Validate size: 5MB for images, 20MB for video/audio/files
+      const isLargeAllowed = file.type.startsWith("video/") || file.type.startsWith("audio/") || file.type.startsWith("application/");
+      const MAX_SIZE = isLargeAllowed ? 20 * 1024 * 1024 : 5 * 1024 * 1024;
       if (file.size > MAX_SIZE) {
         return jsonResponse(
-          { error: `File too large: ${file.size} bytes. Max: ${MAX_SIZE} bytes (5MB)` },
+          { error: `File too large: ${file.size} bytes. Max: ${MAX_SIZE} bytes (${isLargeAllowed ? "20MB" : "5MB"})` },
           400,
           corsHeaders
         );
@@ -1206,7 +1240,14 @@ export default {
         return jsonResponse({ error: "Cloudinary not configured on server" }, 500, corsHeaders);
       }
 
-      const resourceType = file.type.startsWith("video/") ? "video" : "image";
+      // Cloudinary resource types: "image" for images, "video" for video+audio, "raw" for documents
+      const resourceType = file.type.startsWith("video/")
+        ? "video"
+        : file.type.startsWith("audio/")
+          ? "video"   // Cloudinary handles audio under the "video" resource type
+          : file.type.startsWith("image/")
+            ? "image"
+            : "raw";  // documents, zip, etc.
       const cloudinaryUrl = `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`;
 
       // Generate signed upload params
@@ -1241,7 +1282,12 @@ export default {
         return jsonResponse({ error: "Failed to upload file" }, 500, corsHeaders);
       }
 
-      const mediaType = resourceType;
+      // Client-facing mediaType: "image", "video", "audio", or "file"
+      const mediaType = file.type.startsWith("audio/")
+        ? "audio"
+        : resourceType === "raw"
+          ? "file"
+          : resourceType;  // "image" or "video"
       const mediaUrl = (cloudinaryResult.secure_url as string) || (cloudinaryResult.url as string) || "";
       const fileName = file.name || (cloudinaryResult.original_filename as string) || "unknown";
 

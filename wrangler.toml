@@ -37,3 +37,22 @@ new_sqlite_classes = ["ChatRoom", "UserSession", "NotificationRouter", "CallSign
 
 [env.staging]
 name = "cloudflare-chat-staging"
+
+# ============ PRODUCTION ============
+# Deploy:  npx wrangler deploy --env production
+# Secrets: npx wrangler secret put <NAME> --env production
+# Fresh Durable Object namespaces — fully isolated from the dev worker above.
+[env.production]
+name = "cloudflare-chat-prod"
+
+[env.production.durable_objects]
+bindings = [
+  { name = "CHAT_ROOM", class_name = "ChatRoom" },
+  { name = "USER_SESSION", class_name = "UserSession" },
+  { name = "NOTIFICATION_ROUTER", class_name = "NotificationRouter" },
+  { name = "CALL_SIGNALING", class_name = "CallSignaling" }
+]
+
+[[env.production.migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatRoom", "UserSession", "NotificationRouter", "CallSignaling"]

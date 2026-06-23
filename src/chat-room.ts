@@ -58,7 +58,7 @@ export class ChatRoom extends DurableObject<Env> {
       }
 
       if (url.pathname === "/members" && request.method === "GET") {
-        return this.handleListMembers();
+        return await this.handleListMembers();
       }
 
       if (url.pathname === "/stored-participants" && request.method === "GET") {
@@ -615,7 +615,7 @@ export class ChatRoom extends DurableObject<Env> {
 
   // ============ Group Management ============
 
-  private handleListMembers(): Response {
+  private async handleListMembers(): Promise<Response> {
     this.ensureSchema();
     const cursor = this.sql.exec(
       "SELECT user_id, role, joined_at, last_read_index FROM members ORDER BY joined_at ASC"
@@ -627,14 +627,32 @@ export class ChatRoom extends DurableObject<Env> {
       last_read_index: number;
     }>;
 
+    // Merge name/email/image from stored participant metadata (KV)
+    let participantMap = new Map<string, ConversationParticipant>();
+    try {
+      const stored = await this.ctx.storage.get("conversation_participants") as string | undefined;
+      if (stored) {
+        const participants = JSON.parse(stored) as ConversationParticipant[];
+        for (const p of participants) {
+          participantMap.set(p.userId, p);
+        }
+      }
+    } catch { /* no stored participants */ }
+
     return new Response(
       JSON.stringify({
-        members: members.map((m) => ({
-          userId: m.user_id,
-          role: m.role,
-          joinedAt: m.joined_at,
-          lastReadIndex: m.last_read_index ?? 0,
-        })),
+        members: members.map((m) => {
+          const p = participantMap.get(m.user_id);
+          return {
+            userId: m.user_id,
+            role: m.role,
+            joinedAt: m.joined_at,
+            lastReadIndex: m.last_read_index ?? 0,
+            name: p?.name ?? null,
+            email: p?.email ?? null,
+            image: p?.image ?? null,
+          };
+        }),
       }),
       { headers: { "Content-Type": "application/json" } }
     );
@@ -720,12 +738,38 @@ export class ChatRoom extends DurableObject<Env> {
       .toArray() as Array<{ user_id: string }>;
     const existingMemberIds = existingMemberRows.map((r) => r.user_id);
 
-    // Build full participant list (existing members + participants from request)
-    // to send to new members so they see everyone's name/email/image
+    // Fetch existing participants' metadata (name/email/image) from an existing
+    // member's UserSession so newly added members see everyone's display info.
+    // The client only sends metadata for the NEW members being added, not existing ones.
+    let storedParticipants: ConversationParticipant[] = [];
+    if (existingMemberIds.length > 0) {
+      try {
+        const refUserId = existingMemberIds[0];
+        const refStub = this.env.USER_SESSION.get(
+          this.env.USER_SESSION.idFromName(`user_${refUserId}`)
+        );
+        const refResp = await refStub.fetch(
+          `https://internal/conversations/participants?conversationId=${encodeURIComponent(body.conversationId)}`
+        );
+        if (refResp.ok) {
+          const refData = (await refResp.json()) as { participants: ConversationParticipant[] };
+          storedParticipants = refData.participants || [];
+        }
+      } catch (e) {
+        console.error("Failed to fetch stored participants for new member enrichment:", e);
+      }
+    }
+    const storedMap = new Map<string, ConversationParticipant>();
+    for (const sp of storedParticipants) {
+      storedMap.set(sp.userId, sp);
+    }
+
+    // Build full participant list: prefer client-provided data, fall back to stored data
     const allParticipants: ConversationParticipant[] = [];
     for (const memberId of existingMemberIds) {
       const fromRequest = participantMap.get(memberId);
-      allParticipants.push(fromRequest || { userId: memberId });
+      const fromStored = storedMap.get(memberId);
+      allParticipants.push(fromRequest || fromStored || { userId: memberId });
     }
 
     for (const userId of body.userIds) {
@@ -796,12 +840,25 @@ export class ChatRoom extends DurableObject<Env> {
         allParticipants.push(newMemberParticipant);
         existingMemberIds.push(userId);
 
-        // Broadcast member added to existing connections
+        // Broadcast member added to existing connections (include metadata so
+        // clients can update their participant cache without an extra REST call)
         this.broadcast({
           type: "member_added",
           userId,
           addedBy: body.requesterId,
+          name: newMemberParticipant.name,
+          email: newMemberParticipant.email,
+          image: newMemberParticipant.image,
         });
+      }
+    }
+
+    // Keep ChatRoom's conversation_participants KV in sync
+    if (added.length > 0) {
+      try {
+        await this.ctx.storage.put("conversation_participants", JSON.stringify(allParticipants));
+      } catch (e) {
+        console.error("Failed to update conversation_participants KV after add:", e);
       }
     }
 
@@ -917,6 +974,21 @@ export class ChatRoom extends DurableObject<Env> {
           userId,
           removedBy: body.requesterId,
         });
+      }
+    }
+
+    // Keep ChatRoom's conversation_participants KV in sync
+    if (removed.length > 0) {
+      try {
+        const stored = await this.ctx.storage.get("conversation_participants") as string | undefined;
+        if (stored) {
+          const participants = JSON.parse(stored) as ConversationParticipant[];
+          const removedSet = new Set(removed);
+          const filtered = participants.filter(p => !removedSet.has(p.userId));
+          await this.ctx.storage.put("conversation_participants", JSON.stringify(filtered));
+        }
+      } catch (e) {
+        console.error("Failed to update conversation_participants KV after remove:", e);
       }
     }
 
@@ -1910,12 +1982,20 @@ export class ChatRoom extends DurableObject<Env> {
       if (userTag) connectedUserIds.add(userTag.slice(USER_TAG_PREFIX.length));
     }
 
-    // Push only to OFFLINE, non-muted members (excluding sender)
+    // Push to ALL non-muted members (excluding sender). Connected members still get
+    // a push, but on iOS devices only: live iOS builds keep half-open sockets when
+    // the app is suspended, so a "connected" iOS user may be receiving nothing —
+    // and the iOS willPresent handler suppresses the banner when the conversation
+    // is actually on screen. Android clients disconnect on background, so for them
+    // connected == genuinely active and the original skip is preserved.
     const targetMembers = allMemberIds.filter(
-      (id) => id !== senderId && !mutedUserIds.has(id) && !connectedUserIds.has(id)
+      (id) => id !== senderId && !mutedUserIds.has(id)
+    );
+    const iosOnlyTargets = new Set(
+      targetMembers.filter((id) => connectedUserIds.has(id))
     );
 
-    console.log(`[PUSH] notifyAllMembers: convId=${conversationId} sender=${senderId} connected=[${[...connectedUserIds].join(",")}] targets=[${targetMembers.join(",")}]`);
+    console.log(`[PUSH] notifyAllMembers: convId=${conversationId} sender=${senderId} connected=[${[...connectedUserIds].join(",")}] targets=[${targetMembers.join(",")}] iosOnly=[${[...iosOnlyTargets].join(",")}]`);
 
     if (targetMembers.length === 0) {
       console.log(`[PUSH] No members to notify`);
@@ -1985,6 +2065,7 @@ export class ChatRoom extends DurableObject<Env> {
                 ...(senderName ? { senderName } : {}),
                 ...(feature ? { feature } : {}),
               },
+              ...(iosOnlyTargets.has(userId) ? { platforms: ["ios"] } : {}),
             }),
           });
           const result = await resp.json() as { ok: boolean; sent?: number; reason?: string };
